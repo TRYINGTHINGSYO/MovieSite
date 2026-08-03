@@ -27,6 +27,7 @@
   const uploadFill = document.getElementById("upload-fill");
   const uploadLabel = document.getElementById("upload-label");
   const playerError = document.getElementById("player-error");
+  const playerErrorDetail = document.getElementById("player-error-detail");
 
   let applyingRemote = false;
   let state = {
@@ -38,6 +39,12 @@
   };
   let endedHandled = false;
   let positionHeartbeat = null;
+  let loadFailTimer = null;
+
+  const CODEC_HINT =
+    "This browser can't decode that video. Try an MP4 (H.264) export — iPhone screen recordings (.mov) are often HEVC and won't play in Chrome.";
+  const NETWORK_HINT =
+    "The video file didn't load from the server. Re-upload or try a smaller MP4 (H.264).";
 
   // ---- Invite link ----
 
@@ -214,20 +221,48 @@
     }
   }
 
-  function showPlayerError(show) {
+  function showPlayerError(show, detail) {
     if (!playerError) return;
     playerError.hidden = !show;
+    if (show && playerErrorDetail && detail) {
+      playerErrorDetail.textContent = detail;
+    }
+  }
+
+  function clearLoadFailTimer() {
+    if (loadFailTimer) {
+      clearTimeout(loadFailTimer);
+      loadFailTimer = null;
+    }
+  }
+
+  function mediaErrorHint() {
+    const err = player.error;
+    const name = (state.queue[state.current]?.name || "").toLowerCase();
+    if (err && err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+      return CODEC_HINT;
+    }
+    if (err && (err.code === MediaError.MEDIA_ERR_NETWORK || err.code === MediaError.MEDIA_ERR_ABORTED)) {
+      return NETWORK_HINT;
+    }
+    if (name.endsWith(".mov") || name.endsWith(".mkv") || name.endsWith(".avi")) {
+      return CODEC_HINT;
+    }
+    return CODEC_HINT;
   }
 
   player.addEventListener("error", () => {
-    showPlayerError(true);
+    clearLoadFailTimer();
+    showPlayerError(true, mediaErrorHint());
   });
 
   player.addEventListener("loadeddata", () => {
+    clearLoadFailTimer();
     showPlayerError(false);
   });
 
   function loadCurrentVideo(seekTo, shouldPlay) {
+    clearLoadFailTimer();
     if (state.current === null || !state.queue[state.current]) {
       player.hidden = true;
       player.removeAttribute("src");
@@ -268,16 +303,16 @@
 
     if (needsReload) {
       player.src = nextSrc;
-      // If metadata never arrives (bad codec), surface an error instead of spinning forever
-      const failTimer = setTimeout(() => {
-        if (player.readyState < 1) {
-          showPlayerError(true);
+      // Unsupported codecs / hung range fetches often never fire error — surface UI.
+      loadFailTimer = setTimeout(() => {
+        if (player.readyState < 2) {
+          showPlayerError(true, mediaErrorHint());
         }
-      }, 8000);
+      }, 5000);
       player.addEventListener(
         "loadedmetadata",
         () => {
-          clearTimeout(failTimer);
+          clearLoadFailTimer();
           afterReady();
         },
         { once: true }
@@ -285,8 +320,8 @@
       player.addEventListener(
         "error",
         () => {
-          clearTimeout(failTimer);
-          showPlayerError(true);
+          clearLoadFailTimer();
+          showPlayerError(true, mediaErrorHint());
         },
         { once: true }
       );

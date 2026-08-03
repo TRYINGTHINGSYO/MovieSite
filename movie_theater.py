@@ -12,15 +12,17 @@ from pathlib import Path
 
 from flask import (
     Flask,
+    Response,
+    abort,
     flash,
     redirect,
     render_template,
     request,
-    send_from_directory,
     url_for,
 )
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.utils import secure_filename
+from werkzeug.wsgi import wrap_file
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_ROOT = BASE_DIR / "uploads"
@@ -90,6 +92,50 @@ def ensure_upload_dir(code: str) -> Path:
     path = UPLOAD_ROOT / code
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def parse_byte_range(range_header: str, file_size: int) -> tuple[int, int] | None:
+    """Parse a single Range request into inclusive (start, end) offsets."""
+    match = re.match(r"bytes=(\d*)-(\d*)", (range_header or "").strip())
+    if not match or file_size <= 0:
+        return None
+
+    start_s, end_s = match.group(1), match.group(2)
+    if start_s == "" and end_s == "":
+        return None
+
+    if start_s == "":
+        # suffix-byte-range-spec: last N bytes
+        try:
+            suffix = int(end_s)
+        except ValueError:
+            return None
+        if suffix <= 0:
+            return None
+        start = max(0, file_size - suffix)
+        end = file_size - 1
+    else:
+        try:
+            start = int(start_s)
+            end = int(end_s) if end_s else file_size - 1
+        except ValueError:
+            return None
+        if start >= file_size:
+            return None
+        end = min(end, file_size - 1)
+        if start > end:
+            return None
+
+    return start, end
+
+
+def guess_video_mime(filename: str) -> str:
+    mime, _ = mimetypes.guess_type(filename)
+    # Chromium often refuses video/quicktime even when the MOV is H.264.
+    # video/mp4 lets it try the MP4 demuxer for compatible .mov files.
+    if filename.lower().endswith((".mov", ".m4v")):
+        return "video/mp4"
+    return mime or "application/octet-stream"
 
 
 # ---------------------------------------------------------------------------
@@ -172,19 +218,58 @@ def upload_video(code: str):
 
 @app.route("/uploads/<code>/<path:filename>")
 def serve_upload(code: str, filename: str):
+    """Serve uploads with seekable byte ranges.
+
+    Waitress + Werkzeug's default send_file Range path can read from byte 0
+    for every 206, so large videos never buffer in <video>. Seek the file
+    ourselves and hand Waitress a wsgi.file_wrapper with Content-Length.
+    """
     code = code.upper()
-    folder = UPLOAD_ROOT / code
-    mime, _ = mimetypes.guess_type(filename)
-    # conditional=True enables Accept-Ranges / 206 so <video> can seek
-    response = send_from_directory(
-        folder,
-        filename,
-        mimetype=mime or "application/octet-stream",
-        conditional=True,
-    )
-    response.headers["Accept-Ranges"] = "bytes"
-    response.headers["Cache-Control"] = "public, max-age=3600"
-    return response
+    folder = (UPLOAD_ROOT / code).resolve()
+    path = (folder / filename).resolve()
+    try:
+        path.relative_to(folder)
+    except ValueError:
+        abort(404)
+    if not path.is_file():
+        abort(404)
+
+    file_size = path.stat().st_size
+    mime = guess_video_mime(filename)
+    range_header = request.headers.get("Range")
+
+    # Never cache partial media at the edge — wrong 206 bodies break players.
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store",
+        "Content-Type": mime,
+        "Content-Disposition": f'inline; filename="{path.name}"',
+    }
+
+    if range_header:
+        parsed = parse_byte_range(range_header, file_size)
+        if parsed is None:
+            resp = Response(status=416)
+            resp.headers["Content-Range"] = f"bytes */{file_size}"
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+        start, end = parsed
+        length = end - start + 1
+        file_obj = path.open("rb")
+        file_obj.seek(start)
+        data = wrap_file(request.environ, file_obj)
+        headers = {
+            **base_headers,
+            "Content-Length": str(length),
+            "Content-Range": f"bytes {start}-{end}/{file_size}",
+        }
+        return Response(data, status=206, headers=headers, direct_passthrough=True)
+
+    file_obj = path.open("rb")
+    data = wrap_file(request.environ, file_obj)
+    headers = {**base_headers, "Content-Length": str(file_size)}
+    return Response(data, status=200, headers=headers, direct_passthrough=True)
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +441,9 @@ if __name__ == "__main__":
             host="0.0.0.0",
             port=port,
             threads=32,
-            channel_timeout=120,
+            channel_timeout=300,
+            # Screen recordings can exceed Waitress' default 1 GiB body cap
+            max_request_body_size=app.config["MAX_CONTENT_LENGTH"],
             ident="GroupTheater",
         )
     except ImportError:
