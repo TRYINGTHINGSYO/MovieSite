@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Group Theater — Watch Party</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theater.css') }}" />
+</head>
+<body class="page-landing">
+  <div class="ambient" aria-hidden="true"></div>
+  <div class="curtain curtain-left" aria-hidden="true"></div>
+  <div class="curtain curtain-right" aria-hidden="true"></div>
+
+  <main class="landing">
+    <p class="eyebrow">Now playing · private rooms</p>
+    <h1 class="brand">Group Theater</h1>
+    <p class="tagline">Spin up a room, share the code, drop a film — everyone watches in sync.</p>
+
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <ul class="flash" role="alert">
+          {% for message in messages %}
+            <li>{{ message }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+
+    <div class="landing-actions">
+      <form action="{{ url_for('create_session') }}" method="post">
+        <button type="submit" class="btn btn-gold btn-lg">Create a session</button>
+      </form>
+
+      <div class="join-panel">
+        <p class="join-label">Already have a ticket?</p>
+        <form class="join-form" action="{{ url_for('join_session') }}" method="post">
+          <input
+            type="text"
+            name="code"
+            class="code-input"
+            placeholder="7F3K2"
+            maxlength="8"
+            autocomplete="off"
+            spellcheck="false"
+            aria-label="Session code"
+            required
+          />
+          <button type="submit" class="btn btn-velvet">Join with code</button>
+        </form>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

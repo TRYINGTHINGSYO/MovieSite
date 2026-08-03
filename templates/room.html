@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Room {{ code }} · Group Theater</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theater.css') }}" />
+</head>
+<body class="page-room" data-code="{{ code }}">
+  <div class="ambient ambient-room" aria-hidden="true"></div>
+
+  <header class="room-header">
+    <a class="brand-mini" href="{{ url_for('landing') }}">Group Theater</a>
+
+    <div class="ticket" id="ticket">
+      <div class="ticket-stub">
+        <span class="ticket-label">Admit one · session</span>
+        <span class="ticket-code" id="session-code">{{ code }}</span>
+      </div>
+      <div class="ticket-perforation" aria-hidden="true"></div>
+      <div class="ticket-actions">
+        <button type="button" class="btn btn-sm btn-gold" id="copy-link">Copy invite link</button>
+        <span class="copy-feedback" id="copy-feedback" hidden>Copied</span>
+      </div>
+    </div>
+
+    <p class="viewer-badge" id="viewer-badge">
+      <span id="viewer-count">1</span> in the house
+    </p>
+  </header>
+
+  <main class="room-main">
+    <section class="screen-stage" id="screen-stage">
+      <div class="screen-frame" id="drop-zone">
+        <div class="drop-prompt" id="drop-prompt">
+          <p class="drop-title">Drop a film on the screen</p>
+          <p class="drop-sub">or click to browse · any video file</p>
+        </div>
+        <video id="player" class="player" controls playsinline preload="auto" hidden></video>
+        <div class="player-error" id="player-error" hidden>
+          <p class="drop-title">Can't play this file</p>
+          <p class="drop-sub">This browser can't decode that video. Try an MP4 (H.264) export.</p>
+        </div>
+        <div class="upload-progress" id="upload-progress" hidden>
+          <div class="upload-bar"><div class="upload-fill" id="upload-fill"></div></div>
+          <p class="upload-label" id="upload-label">Uploading…</p>
+        </div>
+        <input type="file" id="file-input" accept="video/*" multiple hidden />
+      </div>
+    </section>
+
+    <div class="film-strip" aria-hidden="true">
+      <span></span><span></span><span></span><span></span>
+      <span></span><span></span><span></span><span></span>
+      <span></span><span></span><span></span><span></span>
+    </div>
+
+    <section class="below-screen">
+      <div class="queue-panel">
+        <div class="queue-head">
+          <h2>Queue</h2>
+          <button type="button" class="btn btn-sm btn-velvet" id="add-more">+ Add video</button>
+        </div>
+        <ol class="queue-list" id="queue-list">
+          <li class="queue-empty" id="queue-empty">Nothing queued yet — drag a file onto the screen.</li>
+        </ol>
+      </div>
+
+      <div class="house">
+        <h2 class="house-title">The house</h2>
+        <div class="theater" id="seat-grid" aria-label="Viewer presence seats">
+          {% for r in range(8) %}
+          <div class="row">
+            {% for c in range(12) %}
+            <div class="seat" data-seat="{{ r * 12 + c }}"></div>
+            {% endfor %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/room.js') }}"></script>
+</body>
+</html>
