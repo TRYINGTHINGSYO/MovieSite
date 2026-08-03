@@ -26,6 +26,7 @@ from werkzeug.utils import secure_filename
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_ROOT = BASE_DIR / "uploads"
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 # Help browsers pick the right decoder for common containers
 mimetypes.add_type("video/mp4", ".mp4")
@@ -43,13 +44,16 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", secrets.token_hex(16))
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024  # 2 GB
 
-# Threading mode: use HTTP long-polling (Werkzeug can't do real WebSockets)
+# Threading + gthread workers: Socket.IO long-polls must not starve /uploads
+# Range fetches (that was the "duration shows, never plays" bug on Railway).
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode="threading",
     logger=False,
     engineio_logger=False,
+    ping_timeout=60,
+    ping_interval=25,
 )
 
 CODE_ALPHABET = string.ascii_uppercase + string.digits
@@ -97,7 +101,7 @@ def ensure_upload_dir(code: str) -> Path:
 # Max bytes per video response. Open-ended Range requests (bytes=0-) used to
 # stream the whole file through Waitress, which buffers generators and can
 # send zero bytes for minutes — Chrome shows duration then spins forever.
-VIDEO_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+VIDEO_CHUNK_SIZE = 2 * 1024 * 1024  # 2 MiB
 
 
 def parse_byte_range(range_header: str, file_size: int) -> tuple[int, int] | None:
@@ -526,9 +530,7 @@ if __name__ == "__main__":
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     port = int(os.environ.get("PORT", "5000"))
     print(f"Movie Theater Watch Party — http://0.0.0.0:{port}")
-    # Threaded Socket.IO + short video range responses. Prefer socketio.run so
-    # Engine.IO and HTTP share one correctly wired server (Waitress + Flask app
-    # alone has stalled large media streams behind Railway's proxy).
+    # Local/dev fallback. Production on Railway uses gunicorn gthread (see railway.json).
     socketio.run(
         app,
         host="0.0.0.0",

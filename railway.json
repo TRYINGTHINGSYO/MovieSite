@@ -1,6 +1,6 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
-    "startCommand": "python movie_theater.py"
+    "startCommand": "gunicorn -w 1 --worker-class gthread --threads 100 --bind 0.0.0.0:$PORT --timeout 300 --keep-alive 5 movie_theater:app"
   }
 }

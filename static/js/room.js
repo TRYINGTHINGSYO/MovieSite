@@ -5,9 +5,9 @@
   if (!code) return;
 
   const socket = io({
-    // Werkzeug/dev server can't upgrade WebSockets — polling avoids infinite hang
-    transports: ["polling"],
-    upgrade: false,
+    // Prefer WebSocket so Engine.IO does not hold HTTP workers that video
+    // Range requests need. Polling remains a fallback.
+    transports: ["websocket", "polling"],
     reconnection: true,
     reconnectionAttempts: 10,
   });
@@ -280,6 +280,7 @@
   function clearLoadFailTimer() {
     if (loadFailTimer) {
       clearTimeout(loadFailTimer);
+      clearInterval(loadFailTimer);
       loadFailTimer = null;
     }
   }
@@ -362,24 +363,49 @@
     if (needsReload) {
       player.src = nextSrc;
       // Duration can appear (metadata) while media bytes still stall — wait for canplay.
+      let lastBuffered = 0;
+      let stallTicks = 0;
       const onCanPlay = () => {
         clearLoadFailTimer();
         afterReady();
       };
       player.addEventListener("canplay", onCanPlay, { once: true });
-      loadFailTimer = setTimeout(() => {
-        player.removeEventListener("canplay", onCanPlay);
-        if (player.readyState >= 3) {
+
+      // Poll buffer growth for large files instead of a single short timeout.
+      loadFailTimer = setInterval(() => {
+        if (player.readyState >= 3 || (!player.paused && !player.ended && player.currentTime > 0.1)) {
+          clearLoadFailTimer();
+          player.removeEventListener("canplay", onCanPlay);
           afterReady();
           return;
         }
-        // HAVE_METADATA but never buffered = range serving / network problem
-        if (player.readyState >= 1) {
+        let bufferedEnd = 0;
+        try {
+          if (player.buffered.length) {
+            bufferedEnd = player.buffered.end(player.buffered.length - 1);
+          }
+        } catch {
+          /* ignore */
+        }
+        if (bufferedEnd > lastBuffered + 0.05) {
+          lastBuffered = bufferedEnd;
+          stallTicks = 0;
+          showPlayerError(false);
+          return;
+        }
+        stallTicks += 1;
+        // ~30s with no buffer growth after metadata → surface error
+        if (stallTicks >= 15 && player.readyState >= 1) {
+          clearLoadFailTimer();
+          player.removeEventListener("canplay", onCanPlay);
           showPlayerError(true, NETWORK_HINT);
-        } else {
+        } else if (stallTicks >= 20 && player.readyState < 1) {
+          clearLoadFailTimer();
+          player.removeEventListener("canplay", onCanPlay);
           showPlayerError(true, mediaErrorHint());
         }
-      }, 20000);
+      }, 2000);
+
       player.addEventListener(
         "error",
         () => {
