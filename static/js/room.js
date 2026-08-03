@@ -304,8 +304,12 @@
     showPlayerError(true, mediaErrorHint());
   });
 
-  player.addEventListener("loadeddata", () => {
+  player.addEventListener("playing", () => {
     clearLoadFailTimer();
+    showPlayerError(false);
+  });
+
+  player.addEventListener("loadeddata", () => {
     showPlayerError(false);
   });
 
@@ -334,7 +338,13 @@
     const afterReady = () => {
       applyingRemote = true;
       try {
-        if (typeof seekTo === "number" && !Number.isNaN(seekTo)) {
+        // Avoid seek(0) before buffer exists — it triggers extra Range churn.
+        if (
+          typeof seekTo === "number" &&
+          !Number.isNaN(seekTo) &&
+          seekTo > 0.5 &&
+          Math.abs(player.currentTime - seekTo) > 0.4
+        ) {
           player.currentTime = seekTo;
         }
         if (shouldPlay) {
@@ -351,24 +361,30 @@
 
     if (needsReload) {
       player.src = nextSrc;
-      // Unsupported codecs / hung range fetches often never fire error — surface UI.
+      // Duration can appear (metadata) while media bytes still stall — wait for canplay.
+      const onCanPlay = () => {
+        clearLoadFailTimer();
+        afterReady();
+      };
+      player.addEventListener("canplay", onCanPlay, { once: true });
       loadFailTimer = setTimeout(() => {
-        if (player.readyState < 2) {
+        player.removeEventListener("canplay", onCanPlay);
+        if (player.readyState >= 3) {
+          afterReady();
+          return;
+        }
+        // HAVE_METADATA but never buffered = range serving / network problem
+        if (player.readyState >= 1) {
+          showPlayerError(true, NETWORK_HINT);
+        } else {
           showPlayerError(true, mediaErrorHint());
         }
-      }, 5000);
-      player.addEventListener(
-        "loadedmetadata",
-        () => {
-          clearLoadFailTimer();
-          afterReady();
-        },
-        { once: true }
-      );
+      }, 20000);
       player.addEventListener(
         "error",
         () => {
           clearLoadFailTimer();
+          player.removeEventListener("canplay", onCanPlay);
           showPlayerError(true, mediaErrorHint());
         },
         { once: true }

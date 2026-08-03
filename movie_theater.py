@@ -23,7 +23,6 @@ from flask import (
 from werkzeug.exceptions import RequestEntityTooLarge
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.utils import secure_filename
-from werkzeug.wsgi import wrap_file
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_ROOT = BASE_DIR / "uploads"
@@ -95,6 +94,12 @@ def ensure_upload_dir(code: str) -> Path:
     return path
 
 
+# Max bytes per video response. Open-ended Range requests (bytes=0-) used to
+# stream the whole file through Waitress, which buffers generators and can
+# send zero bytes for minutes — Chrome shows duration then spins forever.
+VIDEO_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+
+
 def parse_byte_range(range_header: str, file_size: int) -> tuple[int, int] | None:
     """Parse a single Range request into inclusive (start, end) offsets."""
     match = re.match(r"bytes=(\d*)-(\d*)", (range_header or "").strip())
@@ -137,6 +142,13 @@ def guess_video_mime(filename: str) -> str:
     if filename.lower().endswith((".mov", ".m4v")):
         return "video/mp4"
     return mime or "application/octet-stream"
+
+
+def read_video_slice(path: Path, start: int, end: int) -> bytes:
+    length = end - start + 1
+    with path.open("rb") as handle:
+        handle.seek(start)
+        return handle.read(length)
 
 
 def enqueue_uploaded_video(code: str, original_name: str, stored_path: Path) -> dict:
@@ -288,13 +300,14 @@ def upload_video(code: str):
     return enqueue_uploaded_video(code, original, incoming)
 
 
-@app.route("/uploads/<code>/<path:filename>")
+@app.route("/uploads/<code>/<path:filename>", methods=["GET", "HEAD"])
 def serve_upload(code: str, filename: str):
-    """Serve uploads with seekable byte ranges.
+    """Serve uploads with capped byte-range responses.
 
-    Waitress + Werkzeug's default send_file Range path can read from byte 0
-    for every 206, so large videos never buffer in <video>. Seek the file
-    ourselves and hand Waitress a wsgi.file_wrapper with Content-Length.
+    Browsers request open-ended ranges (bytes=N-). Streaming those whole
+    tails through Waitress often stalls after metadata (duration shows, spinner
+    forever). Return at most VIDEO_CHUNK_SIZE bytes of real content per 206 so
+    each response finishes immediately; the player requests the next range.
     """
     code = code.upper()
     folder = (UPLOAD_ROOT / code).resolve()
@@ -310,13 +323,16 @@ def serve_upload(code: str, filename: str):
     mime = guess_video_mime(filename)
     range_header = request.headers.get("Range")
 
-    # Never cache partial media at the edge — wrong 206 bodies break players.
-    base_headers = {
+    headers = {
         "Accept-Ranges": "bytes",
-        "Cache-Control": "no-store",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
         "Content-Type": mime,
-        "Content-Disposition": f'inline; filename="{path.name}"',
+        "X-Content-Type-Options": "nosniff",
     }
+
+    if file_size == 0:
+        headers["Content-Length"] = "0"
+        return Response(b"", status=200, headers=headers)
 
     if range_header:
         parsed = parse_byte_range(range_header, file_size)
@@ -325,23 +341,31 @@ def serve_upload(code: str, filename: str):
             resp.headers["Content-Range"] = f"bytes */{file_size}"
             resp.headers["Cache-Control"] = "no-store"
             return resp
-
         start, end = parsed
-        length = end - start + 1
-        file_obj = path.open("rb")
-        file_obj.seek(start)
-        data = wrap_file(request.environ, file_obj)
-        headers = {
-            **base_headers,
-            "Content-Length": str(length),
-            "Content-Range": f"bytes {start}-{end}/{file_size}",
-        }
-        return Response(data, status=206, headers=headers, direct_passthrough=True)
+    else:
+        # No Range: still cap so a huge file cannot wedge the worker thread.
+        start, end = 0, file_size - 1
 
-    file_obj = path.open("rb")
-    data = wrap_file(request.environ, file_obj)
-    headers = {**base_headers, "Content-Length": str(file_size)}
-    return Response(data, status=200, headers=headers, direct_passthrough=True)
+    # Cap every response — critical for bytes=0- / bytes=N- open ranges.
+    end = min(end, start + VIDEO_CHUNK_SIZE - 1, file_size - 1)
+    length = end - start + 1
+
+    if request.method == "HEAD":
+        headers["Content-Length"] = str(length)
+        if range_header or start > 0 or end < file_size - 1:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            return Response(b"", status=206, headers=headers)
+        return Response(b"", status=200, headers=headers)
+
+    data = read_video_slice(path, start, end)
+    headers["Content-Length"] = str(len(data))
+
+    # Always 206 when the client asked for a range, or when we truncated.
+    if range_header or end < file_size - 1 or start > 0:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        return Response(data, status=206, headers=headers)
+
+    return Response(data, status=200, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -502,30 +526,15 @@ if __name__ == "__main__":
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     port = int(os.environ.get("PORT", "5000"))
     print(f"Movie Theater Watch Party — http://0.0.0.0:{port}")
-    # Waitress: many worker threads so Socket.IO long-polls don't starve /uploads
-    # video requests (Werkzeug's debugger often serializes them in practice).
-    try:
-        from waitress import serve
-
-        print("Serving with Waitress (threaded) — Ctrl+C to stop")
-        serve(
-            app,
-            host="0.0.0.0",
-            port=port,
-            threads=32,
-            channel_timeout=300,
-            # Screen recordings can exceed Waitress' default 1 GiB body cap
-            max_request_body_size=app.config["MAX_CONTENT_LENGTH"],
-            ident="GroupTheater",
-        )
-    except ImportError:
-        print("Waitress not installed; falling back to Werkzeug (pip install waitress)")
-        socketio.run(
-            app,
-            host="0.0.0.0",
-            port=port,
-            debug=False,
-            use_reloader=False,
-            allow_unsafe_werkzeug=True,
-            threaded=True,
-        )
+    # Threaded Socket.IO + short video range responses. Prefer socketio.run so
+    # Engine.IO and HTTP share one correctly wired server (Waitress + Flask app
+    # alone has stalled large media streams behind Railway's proxy).
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True,
+        log_output=False,
+    )
