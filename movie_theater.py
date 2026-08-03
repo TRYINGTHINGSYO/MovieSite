@@ -343,7 +343,8 @@ def on_sync_position(data):
 
 if __name__ == "__main__":
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    print("Movie Theater Watch Party — http://127.0.0.1:5000")
+    port = int(os.environ.get("PORT", "5000"))
+    print(f"Movie Theater Watch Party — http://0.0.0.0:{port}")
     # Waitress: many worker threads so Socket.IO long-polls don't starve /uploads
     # video requests (Werkzeug's debugger often serializes them in practice).
     try:
@@ -353,7 +354,7 @@ if __name__ == "__main__":
         serve(
             app,
             host="0.0.0.0",
-            port=5000,
+            port=port,
             threads=32,
             channel_timeout=120,
             ident="GroupTheater",
@@ -363,7 +364,7 @@ if __name__ == "__main__":
         socketio.run(
             app,
             host="0.0.0.0",
-            port=5000,
+            port=port,
             debug=False,
             use_reloader=False,
             allow_unsafe_werkzeug=True,
