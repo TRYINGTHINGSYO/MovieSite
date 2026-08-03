@@ -20,6 +20,7 @@ from flask import (
     request,
     url_for,
 )
+from werkzeug.exceptions import RequestEntityTooLarge
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from werkzeug.utils import secure_filename
 from werkzeug.wsgi import wrap_file
@@ -138,9 +139,41 @@ def guess_video_mime(filename: str) -> str:
     return mime or "application/octet-stream"
 
 
+def enqueue_uploaded_video(code: str, original_name: str, stored_path: Path) -> dict:
+    """Register a finished upload in the session queue and notify the room."""
+    video_id = uuid.uuid4().hex[:10]
+    stem = Path(original_name).stem or "video"
+    ext = Path(original_name).suffix.lower() or stored_path.suffix.lower()
+    stored_name = f"{video_id}_{stem}{ext}"
+    folder = ensure_upload_dir(code)
+    final_path = folder / stored_name
+    stored_path.replace(final_path)
+
+    item = {
+        "id": video_id,
+        "name": original_name,
+        "url": url_for("serve_upload", code=code, filename=stored_name),
+    }
+    session = sessions[code]
+    session["queue"].append(item)
+
+    if session["current"] is None:
+        session["current"] = 0
+        session["playing"] = True
+        session["position"] = 0.0
+
+    socketio.emit("queue_updated", public_state(session), room=code)
+    return {"ok": True, "item": item, "state": public_state(session)}
+
+
 # ---------------------------------------------------------------------------
 # HTTP routes
 # ---------------------------------------------------------------------------
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def too_large(_err):
+    return {"error": "File too large for this server."}, 413
 
 
 @app.route("/")
@@ -177,6 +210,7 @@ def session_room(code: str):
 
 @app.route("/upload/<code>", methods=["POST"])
 def upload_video(code: str):
+    """Accept a full file or a single chunk (chunked uploads for Railway limits)."""
     code = code.upper()
     if code not in sessions:
         return {"error": "Session not found"}, 404
@@ -185,35 +219,73 @@ def upload_video(code: str):
         return {"error": "No file provided"}, 400
 
     file = request.files["file"]
-    if not file or not file.filename:
+    if not file:
+        return {"error": "Empty upload"}, 400
+
+    # Chunked mode — small POSTs stay under Railway's 5-minute body timeout
+    upload_id = (request.form.get("upload_id") or "").strip()
+    chunk_index = request.form.get("chunk_index")
+    chunk_total = request.form.get("chunk_total")
+    original = secure_filename(request.form.get("filename") or file.filename or "") or "video"
+
+    if upload_id and chunk_index is not None and chunk_total is not None:
+        try:
+            index = int(chunk_index)
+            total = int(chunk_total)
+        except ValueError:
+            return {"error": "Invalid chunk metadata"}, 400
+
+        if not re.fullmatch(r"[a-fA-F0-9-]{8,64}", upload_id):
+            return {"error": "Invalid upload id"}, 400
+        if total < 1 or total > 50_000 or index < 0 or index >= total:
+            return {"error": "Invalid chunk range"}, 400
+
+        tmp_dir = ensure_upload_dir(code) / ".parts" / upload_id
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        part_path = tmp_dir / f"{index:06d}.part"
+        file.save(part_path)
+
+        if index < total - 1:
+            return {"ok": True, "received": index, "total": total}
+
+        # Last chunk: assemble in order, then enqueue
+        assembled = tmp_dir / "assembled"
+        try:
+            with assembled.open("wb") as out:
+                for i in range(total):
+                    part = tmp_dir / f"{i:06d}.part"
+                    if not part.is_file():
+                        return {"error": f"Missing chunk {i}"}, 400
+                    with part.open("rb") as inp:
+                        while True:
+                            buf = inp.read(1024 * 1024)
+                            if not buf:
+                                break
+                            out.write(buf)
+            result = enqueue_uploaded_video(code, original, assembled)
+        except Exception:
+            try:
+                assembled.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        else:
+            try:
+                for p in tmp_dir.iterdir():
+                    p.unlink(missing_ok=True)
+                tmp_dir.rmdir()
+            except OSError:
+                pass
+        return result
+
+    # Legacy single-shot upload (small files)
+    if not file.filename and not original:
         return {"error": "Empty filename"}, 400
-
-    # Accept any video extension / container the browser can send
-    original = secure_filename(file.filename) or "video"
-    stem = Path(original).stem or "video"
-    ext = Path(original).suffix.lower()
-    video_id = uuid.uuid4().hex[:10]
-    stored_name = f"{video_id}_{stem}{ext}"
-
+    original = secure_filename(file.filename or original) or "video"
     folder = ensure_upload_dir(code)
-    file.save(folder / stored_name)
-
-    item = {
-        "id": video_id,
-        "name": original,
-        "url": url_for("serve_upload", code=code, filename=stored_name),
-    }
-    session = sessions[code]
-    session["queue"].append(item)
-
-    # First item in the queue: select it and start playback for everyone
-    if session["current"] is None:
-        session["current"] = 0
-        session["playing"] = True
-        session["position"] = 0.0
-
-    socketio.emit("queue_updated", public_state(session), room=code)
-    return {"ok": True, "item": item, "state": public_state(session)}
+    incoming = folder / f".incoming_{uuid.uuid4().hex}"
+    file.save(incoming)
+    return enqueue_uploaded_video(code, original, incoming)
 
 
 @app.route("/uploads/<code>/<path:filename>")

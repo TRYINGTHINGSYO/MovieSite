@@ -117,48 +117,96 @@
     files.reduce((chain, file) => chain.then(() => uploadOne(file)), Promise.resolve());
   }
 
+  // Railway closes request bodies after 5 minutes — send small chunks instead.
+  const CHUNK_SIZE = 2 * 1024 * 1024;
+
   function uploadOne(file) {
+    const uploadId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+    const total = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+
+    uploadProgress.hidden = false;
+    uploadFill.style.width = "0%";
+    uploadLabel.textContent = `Uploading ${file.name}…`;
+
+    let chain = Promise.resolve();
+    for (let index = 0; index < total; index += 1) {
+      const start = index * CHUNK_SIZE;
+      const blob = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+      chain = chain.then(() =>
+        postChunk({
+          file,
+          blob,
+          uploadId,
+          index,
+          total,
+          bytesSentBefore: start,
+        })
+      );
+    }
+
+    return chain
+      .then((data) => {
+        uploadProgress.hidden = true;
+        if (data?.state) applyState(data.state);
+      })
+      .catch((err) => {
+        uploadProgress.hidden = true;
+        alert(err?.message || "Upload failed.");
+        throw err;
+      });
+  }
+
+  function postChunk({ file, blob, uploadId, index, total, bytesSentBefore }) {
     return new Promise((resolve, reject) => {
       const form = new FormData();
-      form.append("file", file);
-
-      uploadProgress.hidden = false;
-      uploadFill.style.width = "0%";
-      uploadLabel.textContent = `Uploading ${file.name}…`;
+      form.append("file", blob, file.name);
+      form.append("filename", file.name);
+      form.append("upload_id", uploadId);
+      form.append("chunk_index", String(index));
+      form.append("chunk_total", String(total));
 
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `/upload/${code}`);
+      // Each chunk should finish well under Railway's 5-minute body limit
+      xhr.timeout = 4 * 60 * 1000;
+
       xhr.upload.onprogress = (e) => {
         if (!e.lengthComputable) return;
-        const pct = Math.round((e.loaded / e.total) * 100);
+        const sent = bytesSentBefore + e.loaded;
+        const pct = Math.min(100, Math.round((sent / file.size) * 100));
         uploadFill.style.width = `${pct}%`;
         uploadLabel.textContent = `Uploading ${file.name}… ${pct}%`;
       };
+
       xhr.onload = () => {
-        uploadProgress.hidden = true;
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            const data = JSON.parse(xhr.responseText);
-            if (data.state) applyState(data.state);
-          } catch {
-            /* queue_updated socket event will catch up */
-          }
-          resolve();
-        } else {
-          let msg = "Upload failed";
-          try {
-            msg = JSON.parse(xhr.responseText).error || msg;
-          } catch {
-            /* ignore */
-          }
-          alert(msg);
-          reject(new Error(msg));
+        let payload = null;
+        try {
+          payload = JSON.parse(xhr.responseText);
+        } catch {
+          /* ignore */
         }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(payload || { ok: true });
+          return;
+        }
+        const msg =
+          (payload && payload.error) ||
+          `Upload failed (HTTP ${xhr.status || "error"}).`;
+        reject(new Error(msg));
       };
+
       xhr.onerror = () => {
-        uploadProgress.hidden = true;
-        alert("Upload failed — network error.");
-        reject(new Error("network"));
+        reject(
+          new Error(
+            "Upload failed — connection dropped. Try a smaller file or check your network."
+          )
+        );
+      };
+      xhr.ontimeout = () => {
+        reject(new Error("Upload timed out. Try again on a faster connection."));
       };
       xhr.send(form);
     });
