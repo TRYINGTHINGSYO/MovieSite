@@ -551,6 +551,15 @@
     renderQueue();
     if (typeof next.viewer_count === "number") setViewerCount(next.viewer_count);
 
+    // Keep originals saved until the item leaves the queue (then free memory)
+    const liveIds = new Set((state.queue || []).map((q) => q.id));
+    for (const [id, local] of [...localFiles.entries()]) {
+      if (!liveIds.has(id)) {
+        URL.revokeObjectURL(local.blobUrl);
+        localFiles.delete(id);
+      }
+    }
+
     const newId =
       state.current != null && state.queue[state.current]
         ? state.queue[state.current].id
