@@ -657,11 +657,14 @@
   socket.on("play", (payload) => {
     applyingRemote = true;
     try {
-      const el = mediaEl || player;
+      const el = mediaEl || muxPlayer || player;
       if (typeof payload.position === "number" && Math.abs((el.currentTime || 0) - payload.position) > 0.4) {
         el.currentTime = payload.position;
       }
-      el.play?.().catch?.(() => {});
+      const p = el.play?.();
+      if (p && typeof p.catch === "function") {
+        p.catch(() => setTapToPlay(true));
+      }
     } finally {
       setTimeout(() => {
         applyingRemote = false;
