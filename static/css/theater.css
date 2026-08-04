@@ -398,7 +398,7 @@ a:hover {
   display: flex;
   align-items: center;
   justify-content: center;
-  cursor: pointer;
+  cursor: default;
   overflow: hidden;
   animation: curtain-reveal 0.9s ease-out both;
 }

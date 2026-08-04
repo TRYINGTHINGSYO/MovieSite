@@ -115,12 +115,6 @@
     fileInput.click();
   }
 
-  dropZone.addEventListener("click", (e) => {
-    if (e.target.closest("video") || e.target.closest(".btn") || e.target.closest("a")) return;
-    if (!player.hidden) return;
-    openPicker();
-  });
-
   addMoreBtn.addEventListener("click", openPicker);
 
   fileInput.addEventListener("change", () => {
