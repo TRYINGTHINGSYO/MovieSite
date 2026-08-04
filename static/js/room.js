@@ -286,7 +286,9 @@
   }
 
   function renderQueue() {
-    queueList.querySelectorAll(".queue-item").forEach((el) => el.remove());
+    // Remove whole list rows (not just the button) — leaving empty <li>s
+    // was pushing the queue further down on every upload/status update.
+    queueList.querySelectorAll("li:not(#queue-empty)").forEach((el) => el.remove());
 
     if (!state.queue.length) {
       queueEmpty.hidden = false;
