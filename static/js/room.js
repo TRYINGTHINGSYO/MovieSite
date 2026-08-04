@@ -29,6 +29,7 @@
   const downloadBtn = document.getElementById("download-original");
   const prepareBanner = document.getElementById("prepare-banner");
   const muxPlayer = document.getElementById("mux-player");
+  const tapToPlay = document.getElementById("tap-to-play");
 
   let applyingRemote = false;
   let state = {
@@ -45,6 +46,7 @@
   let activePlaybackId = null;
   let pollTimers = {};
   let mediaEl = player; // whichever is currently driving playback
+  let needsGesture = false;
 
   // Local originals for the uploader (instant play + re-download)
   const localFiles = new Map(); // video_id -> { file, blobUrl }
@@ -68,11 +70,37 @@
     prepareBanner.textContent = text;
   }
 
+  function setTapToPlay(show) {
+    needsGesture = !!show;
+    if (!tapToPlay) return;
+    tapToPlay.hidden = !show;
+  }
+
   function updateDownloadButton() {
     if (!downloadBtn) return;
     const item = state.current != null ? state.queue[state.current] : null;
     const local = item ? localFiles.get(item.id) : null;
     downloadBtn.hidden = !local;
+  }
+
+  if (tapToPlay) {
+    tapToPlay.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setTapToPlay(false);
+      const el = mediaEl || muxPlayer || player;
+      if (!el) return;
+      applyingRemote = true;
+      const p = el.play();
+      Promise.resolve(p)
+        .catch(() => {})
+        .finally(() => {
+          setTimeout(() => {
+            applyingRemote = false;
+          }, 120);
+        });
+      socket.emit("play", { code, position: el.currentTime || 0 });
+    });
   }
 
   // ---- Invite link ----
@@ -234,7 +262,7 @@
   }
 
   function startStatusPoll(videoId) {
-    if (pollTimers[videoId]) clearInterval(pollTimers[videoId]);
+    if (pollTimers[videoId]) return; // already polling
     let ticks = 0;
     pollTimers[videoId] = setInterval(async () => {
       ticks += 1;
@@ -258,7 +286,9 @@
           delete pollTimers[videoId];
           uploadProgress.hidden = true;
           setPrepareBanner("");
-          showPlayerError(true, item.error || "Mux could not process this video.");
+          if (!localFiles.has(videoId)) {
+            showPlayerError(true, item.error || "Mux could not process this video.");
+          }
         } else if (ticks > 180) {
           clearInterval(pollTimers[videoId]);
           delete pollTimers[videoId];
@@ -269,6 +299,14 @@
         /* keep polling */
       }
     }, 2000);
+  }
+
+  function ensurePollingForQueue() {
+    (state.queue || []).forEach((item) => {
+      if (item.status === "uploading" || item.status === "processing") {
+        startStatusPoll(item.id);
+      }
+    });
   }
 
   // ---- Queue UI ----
@@ -370,13 +408,8 @@
     const p = el.play();
     if (p && typeof p.catch === "function") {
       p.catch(() => {
-        el.addEventListener(
-          "canplay",
-          () => {
-            el.play().catch(() => {});
-          },
-          { once: true }
-        );
+        // Mobile browsers block autoplay — show tap gate instead of a frozen frame
+        setTapToPlay(true);
       });
     }
   }
@@ -386,6 +419,7 @@
     dropPrompt.hidden = true;
     dropZone.classList.add("has-video");
     showPlayerError(false);
+    setTapToPlay(false);
     activeSrc = blobUrl;
     activePlaybackId = null;
     player.src = blobUrl;
@@ -412,6 +446,11 @@
     muxPlayer.primaryColor = "#F5F1E8";
     muxPlayer.secondaryColor = "rgba(14, 14, 16, 0.82)";
     muxPlayer.accentColor = "#E8B84B";
+    // Poster so guests/mobile see something while waiting to tap
+    muxPlayer.setAttribute(
+      "poster",
+      `https://image.mux.com/${playbackId}/thumbnail.webp?time=1`
+    );
     muxPlayer.playbackId = playbackId;
     muxPlayer.setAttribute("playback-id", playbackId);
 
@@ -419,10 +458,17 @@
       applyingRemote = true;
       try {
         if (typeof seekTo === "number" && seekTo > 0.35) {
-          muxPlayer.currentTime = seekTo;
+          try {
+            muxPlayer.currentTime = seekTo;
+          } catch {
+            /* ignore seek until buffered */
+          }
         }
         if (shouldPlay) tryPlay(muxPlayer);
-        else muxPlayer.pause();
+        else {
+          muxPlayer.pause();
+          setTapToPlay(true);
+        }
       } finally {
         setTimeout(() => {
           applyingRemote = false;
@@ -430,13 +476,12 @@
       }
     };
 
-    if (same && muxPlayer.readyState >= 2) {
-      afterReady();
+    if (same && !muxPlayer.paused && (muxPlayer.readyState || 0) >= 2) {
+      setTapToPlay(false);
       return;
     }
 
     const onError = () => {
-      // Host keeps their saved original if Mux player fails
       const item = state.current != null ? state.queue[state.current] : null;
       const local = item ? localFiles.get(item.id) : null;
       if (local) {
@@ -444,18 +489,26 @@
         playLocalPreview(local.blobUrl, shouldPlay);
         return;
       }
-      showPlayerError(
-        true,
-        "Could not play the shared stream. Guests: refresh. Host: use Download original / re-add."
-      );
+      setTapToPlay(true);
+      setPrepareBanner("Stream loaded — tap play to join the room.");
     };
 
     muxPlayer.addEventListener("loadedmetadata", afterReady, { once: true });
+    muxPlayer.addEventListener("playing", () => setTapToPlay(false));
     muxPlayer.addEventListener("error", onError, { once: true });
-    // Mux Player sometimes needs a tick after setting playback-id
-    setTimeout(() => {
-      if (shouldPlay) tryPlay(muxPlayer);
-    }, 50);
+
+    // Always offer tap-to-play for guests/mobile; autoplay may still work on desktop
+    if (shouldPlay) {
+      setTimeout(() => tryPlay(muxPlayer), 80);
+      // If still paused shortly after, show the overlay
+      setTimeout(() => {
+        if (muxPlayer && muxPlayer.paused && activePlaybackId === playbackId) {
+          setTapToPlay(true);
+        }
+      }, 700);
+    } else {
+      setTapToPlay(true);
+    }
   }
 
   function loadCurrentVideo(seekTo, shouldPlay, opts = {}) {
@@ -472,6 +525,7 @@
       dropZone.classList.remove("has-video");
       showPlayerError(false);
       setPrepareBanner("");
+      setTapToPlay(false);
       activeSrc = null;
       activePlaybackId = null;
       updateDownloadButton();
@@ -481,7 +535,7 @@
     updateDownloadButton();
     const local = localFiles.get(item.id);
 
-    // Shared Mux stream for the whole room
+    // Shared Mux stream for the whole room (host + guests)
     if (item.status === "ready" && item.playback_id) {
       setPrepareBanner("");
       uploadProgress.hidden = true;
@@ -492,7 +546,10 @@
             muxPlayer.currentTime = seekTo;
           }
           if (shouldPlay && muxPlayer.paused) tryPlay(muxPlayer);
-          if (!shouldPlay && !muxPlayer.paused) muxPlayer.pause();
+          if (!shouldPlay && !muxPlayer.paused) {
+            muxPlayer.pause();
+            setTapToPlay(true);
+          }
         } finally {
           setTimeout(() => {
             applyingRemote = false;
@@ -500,7 +557,7 @@
         }
         return;
       }
-      attachMuxStream(item.playback_id, seekTo || 0, shouldPlay);
+      attachMuxStream(item.playback_id, seekTo || 0, !!shouldPlay);
       return;
     }
 
@@ -512,11 +569,12 @@
       }
       showPlayerError(true, item.error || "This video failed to process.");
       setPrepareBanner("");
+      setTapToPlay(false);
       return;
     }
 
-    // Host local preview while uploading/processing — original stays saved in memory
-    if (local && (opts.preferLocalId === item.id || item.status !== "ready")) {
+    // Host local preview while uploading/processing
+    if (local) {
       setPrepareBanner(
         item.status === "processing"
           ? "Playing your saved copy — shared stream is processing on Mux…"
@@ -530,11 +588,13 @@
       return;
     }
 
-    // Guests waiting on Mux
+    // Guests waiting on Mux — poll so they catch "ready" even if a socket event was missed
+    startStatusPoll(item.id);
     dropPrompt.hidden = true;
-    player.hidden = false;
+    player.hidden = true;
     dropZone.classList.add("has-video");
     if (muxPlayer) muxPlayer.hidden = true;
+    setTapToPlay(false);
     setPrepareBanner(`“${item.name}” is saving & processing for the room…`);
   }
 
@@ -548,7 +608,6 @@
     renderQueue();
     if (typeof next.viewer_count === "number") setViewerCount(next.viewer_count);
 
-    // Keep originals saved until the item leaves the queue (then free memory)
     const liveIds = new Set((state.queue || []).map((q) => q.id));
     for (const [id, local] of [...localFiles.entries()]) {
       if (!liveIds.has(id)) {
@@ -556,6 +615,8 @@
         localFiles.delete(id);
       }
     }
+
+    ensurePollingForQueue();
 
     const newId =
       state.current != null && state.queue[state.current]

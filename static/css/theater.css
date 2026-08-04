@@ -521,6 +521,45 @@ a:hover {
   display: none !important;
 }
 
+.tap-to-play {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  border: none;
+  background: rgba(11, 11, 12, 0.55);
+  color: var(--ticket);
+  cursor: pointer;
+  font-family: var(--font-body);
+}
+
+.tap-to-play[hidden] {
+  display: none !important;
+}
+
+.tap-to-play-icon {
+  width: 4.5rem;
+  height: 4.5rem;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: var(--gold);
+  color: var(--velvet-deep);
+  font-size: 1.6rem;
+  padding-left: 0.2rem;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
+}
+
+.tap-to-play-label {
+  font-family: var(--font-display);
+  letter-spacing: 0.06em;
+  font-size: 1.35rem;
+}
+
 .mux-warning {
   margin: 0.75rem auto 0;
   max-width: 40rem;

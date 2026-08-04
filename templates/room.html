@@ -46,12 +46,18 @@
           class="player mux-player"
           stream-type="on-demand"
           playsinline
+          preload="auto"
+          crossorigin="anonymous"
           primary-color="#F5F1E8"
           secondary-color="rgba(14, 14, 16, 0.82)"
           accent-color="#E8B84B"
           hidden
         ></mux-player>
         <div class="prepare-banner" id="prepare-banner" hidden></div>
+        <button type="button" class="tap-to-play" id="tap-to-play" hidden>
+          <span class="tap-to-play-icon" aria-hidden="true">▶</span>
+          <span class="tap-to-play-label">Tap to play with the room</span>
+        </button>
         <div class="player-error" id="player-error" hidden>
           <p class="drop-title">Can't play this file</p>
           <p class="drop-sub" id="player-error-detail">Try another video, or check Mux credentials on the server.</p>
