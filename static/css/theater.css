@@ -443,7 +443,13 @@ a:hover {
   object-fit: contain;
 }
 
+.mux-player {
+  --controls: inline;
+  --media-object-fit: contain;
+}
+
 .player[hidden],
+.mux-player[hidden],
 .drop-prompt[hidden],
 .upload-progress[hidden],
 .player-error[hidden] {

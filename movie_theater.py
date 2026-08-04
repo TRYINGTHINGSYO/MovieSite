@@ -103,7 +103,7 @@ def refresh_mux_item(item: dict) -> dict:
     """Poll Mux upload/asset and update queue item fields in place."""
     if not mux_configured():
         return item
-    if item.get("status") == "ready" and item.get("url"):
+    if item.get("status") == "ready" and item.get("playback_id") and item.get("url"):
         return item
 
     upload_id = item.get("mux_upload_id")
@@ -140,18 +140,31 @@ def refresh_mux_item(item: dict) -> dict:
                 if asset_status == "ready":
                     playback_ids = data.get("playback_ids") or []
                     public = next(
-                        (p for p in playback_ids if p.get("policy") == "public"),
+                        (
+                            p
+                            for p in playback_ids
+                            if (p.get("policy") or "").lower() == "public"
+                        ),
                         playback_ids[0] if playback_ids else None,
                     )
-                    if public and public.get("id"):
-                        item["playback_id"] = public["id"]
-                        item["url"] = hls_url(public["id"])
+                    pid = (public or {}).get("id")
+                    if pid:
+                        item["playback_id"] = pid
+                        item["url"] = hls_url(pid)
                         item["status"] = "ready"
                         item["duration"] = data.get("duration")
+                    else:
+                        # Asset ready but playback id not listed yet — keep polling
+                        item["status"] = "processing"
                 elif asset_status == "errored":
                     item["status"] = "error"
                     errs = data.get("errors") or {}
-                    item["error"] = errs.get("messages", ["Mux processing failed"])[0]
+                    msgs = errs.get("messages") if isinstance(errs, dict) else None
+                    item["error"] = (
+                        msgs[0]
+                        if isinstance(msgs, list) and msgs
+                        else "Mux processing failed"
+                    )
                 else:
                     item["status"] = "processing"
     except requests.RequestException as exc:

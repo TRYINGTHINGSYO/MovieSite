@@ -28,6 +28,7 @@
   const playerErrorDetail = document.getElementById("player-error-detail");
   const downloadBtn = document.getElementById("download-original");
   const prepareBanner = document.getElementById("prepare-banner");
+  const muxPlayer = document.getElementById("mux-player");
 
   let applyingRemote = false;
   let state = {
@@ -40,9 +41,10 @@
   };
   let endedHandled = false;
   let positionHeartbeat = null;
-  let hls = null;
   let activeSrc = null;
+  let activePlaybackId = null;
   let pollTimers = {};
+  let mediaEl = player; // whichever is currently driving playback
 
   // Local originals for the uploader (instant play + re-download)
   const localFiles = new Map(); // video_id -> { file, blobUrl }
@@ -327,21 +329,57 @@
 
   // ---- Player ----
 
-  function destroyHls() {
-    if (hls) {
-      hls.destroy();
-      hls = null;
-    }
+  function bindMediaEvents(el) {
+    if (!el || el._theaterBound) return;
+    el._theaterBound = true;
+    el.addEventListener("play", () => {
+      if (applyingRemote) return;
+      socket.emit("play", { code, position: el.currentTime || 0 });
+    });
+    el.addEventListener("pause", () => {
+      if (applyingRemote) return;
+      if (el.ended) return;
+      socket.emit("pause", { code, position: el.currentTime || 0 });
+    });
+    el.addEventListener("seeked", () => {
+      if (applyingRemote) return;
+      socket.emit("seek", { code, position: el.currentTime || 0 });
+    });
+    el.addEventListener("ended", () => {
+      if (endedHandled) return;
+      endedHandled = true;
+      const item = state.current != null ? state.queue[state.current] : null;
+      // Keep local original available for download until room advances
+      socket.emit("video_ended", { code, index: state.current });
+    });
   }
 
-  function tryPlay() {
-    const p = player.play();
+  bindMediaEvents(player);
+  if (muxPlayer) bindMediaEvents(muxPlayer);
+
+  function showLocalPlayer() {
+    player.hidden = false;
+    if (muxPlayer) muxPlayer.hidden = true;
+    mediaEl = player;
+  }
+
+  function showMuxPlayer() {
+    player.hidden = true;
+    player.removeAttribute("src");
+    player.load();
+    if (muxPlayer) muxPlayer.hidden = false;
+    mediaEl = muxPlayer || player;
+  }
+
+  function tryPlay(el = mediaEl) {
+    if (!el) return;
+    const p = el.play();
     if (p && typeof p.catch === "function") {
       p.catch(() => {
-        player.addEventListener(
+        el.addEventListener(
           "canplay",
           () => {
-            player.play().catch(() => {});
+            el.play().catch(() => {});
           },
           { once: true }
         );
@@ -350,85 +388,95 @@
   }
 
   function playLocalPreview(blobUrl, shouldPlay) {
-    destroyHls();
+    showLocalPlayer();
     dropPrompt.hidden = true;
-    player.hidden = false;
     dropZone.classList.add("has-video");
     showPlayerError(false);
     activeSrc = blobUrl;
+    activePlaybackId = null;
     player.src = blobUrl;
     player.load();
-    if (shouldPlay) tryPlay();
+    if (shouldPlay) tryPlay(player);
     updateDownloadButton();
   }
 
-  function attachHls(url, seekTo, shouldPlay) {
-    destroyHls();
+  function attachMuxStream(playbackId, seekTo, shouldPlay) {
+    if (!muxPlayer || !playbackId) {
+      showPlayerError(true, "Shared stream unavailable.");
+      return;
+    }
+
     dropPrompt.hidden = true;
-    player.hidden = false;
     dropZone.classList.add("has-video");
     showPlayerError(false);
     endedHandled = false;
-    activeSrc = url;
+    showMuxPlayer();
+
+    const same = activePlaybackId === playbackId;
+    activePlaybackId = playbackId;
+    activeSrc = playbackId;
+    muxPlayer.playbackId = playbackId;
+    muxPlayer.setAttribute("playback-id", playbackId);
 
     const afterReady = () => {
       applyingRemote = true;
       try {
         if (typeof seekTo === "number" && seekTo > 0.35) {
-          player.currentTime = seekTo;
+          muxPlayer.currentTime = seekTo;
         }
-        if (shouldPlay) tryPlay();
-        else player.pause();
+        if (shouldPlay) tryPlay(muxPlayer);
+        else muxPlayer.pause();
       } finally {
         setTimeout(() => {
           applyingRemote = false;
-        }, 150);
+        }, 200);
       }
     };
 
-    if (player.canPlayType("application/vnd.apple.mpegurl")) {
-      player.src = url;
-      player.addEventListener("loadedmetadata", afterReady, { once: true });
-      player.addEventListener(
-        "error",
-        () => showPlayerError(true, "Could not play the shared stream."),
-        { once: true }
+    if (same && muxPlayer.readyState >= 2) {
+      afterReady();
+      return;
+    }
+
+    const onError = () => {
+      // Host keeps their saved original if Mux player fails
+      const item = state.current != null ? state.queue[state.current] : null;
+      const local = item ? localFiles.get(item.id) : null;
+      if (local) {
+        setPrepareBanner("Shared stream hiccup — playing your saved original.");
+        playLocalPreview(local.blobUrl, shouldPlay);
+        return;
+      }
+      showPlayerError(
+        true,
+        "Could not play the shared stream. Guests: refresh. Host: use Download original / re-add."
       );
-      player.load();
-      return;
-    }
+    };
 
-    if (typeof Hls !== "undefined" && Hls.isSupported()) {
-      hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-      });
-      hls.loadSource(url);
-      hls.attachMedia(player);
-      hls.on(Hls.Events.MANIFEST_PARSED, afterReady);
-      hls.on(Hls.Events.ERROR, (_evt, data) => {
-        if (data?.fatal) {
-          showPlayerError(true, "Shared stream error — try re-adding the video.");
-        }
-      });
-      return;
-    }
-
-    showPlayerError(true, "This browser cannot play HLS video.");
+    muxPlayer.addEventListener("loadedmetadata", afterReady, { once: true });
+    muxPlayer.addEventListener("error", onError, { once: true });
+    // Mux Player sometimes needs a tick after setting playback-id
+    setTimeout(() => {
+      if (shouldPlay) tryPlay(muxPlayer);
+    }, 50);
   }
 
   function loadCurrentVideo(seekTo, shouldPlay, opts = {}) {
     const item = state.current != null ? state.queue[state.current] : null;
     if (!item) {
-      destroyHls();
       player.hidden = true;
       player.removeAttribute("src");
       player.load();
+      if (muxPlayer) {
+        muxPlayer.hidden = true;
+        muxPlayer.removeAttribute("playback-id");
+      }
       dropPrompt.hidden = false;
       dropZone.classList.remove("has-video");
       showPlayerError(false);
       setPrepareBanner("");
       activeSrc = null;
+      activePlaybackId = null;
       updateDownloadButton();
       return;
     }
@@ -436,18 +484,18 @@
     updateDownloadButton();
     const local = localFiles.get(item.id);
 
-    // Prefer shared Mux HLS when ready so everyone watches the same stream.
-    if (item.status === "ready" && item.url) {
+    // Shared Mux stream for the whole room
+    if (item.status === "ready" && item.playback_id) {
       setPrepareBanner("");
       uploadProgress.hidden = true;
-      if (activeSrc === item.url) {
+      if (activePlaybackId === item.playback_id && mediaEl === muxPlayer) {
         applyingRemote = true;
         try {
-          if (typeof seekTo === "number" && Math.abs(player.currentTime - seekTo) > 0.75) {
-            player.currentTime = seekTo;
+          if (typeof seekTo === "number" && Math.abs((muxPlayer.currentTime || 0) - seekTo) > 0.75) {
+            muxPlayer.currentTime = seekTo;
           }
-          if (shouldPlay && player.paused) tryPlay();
-          if (!shouldPlay && !player.paused) player.pause();
+          if (shouldPlay && muxPlayer.paused) tryPlay(muxPlayer);
+          if (!shouldPlay && !muxPlayer.paused) muxPlayer.pause();
         } finally {
           setTimeout(() => {
             applyingRemote = false;
@@ -455,27 +503,32 @@
         }
         return;
       }
-      attachHls(item.url, seekTo || 0, shouldPlay);
+      attachMuxStream(item.playback_id, seekTo || 0, shouldPlay);
       return;
     }
 
     if (item.status === "error") {
+      if (local) {
+        setPrepareBanner("Processing failed — playing your saved original.");
+        playLocalPreview(local.blobUrl, shouldPlay);
+        return;
+      }
       showPlayerError(true, item.error || "This video failed to process.");
       setPrepareBanner("");
       return;
     }
 
-    // Host local preview while uploading/processing
+    // Host local preview while uploading/processing — original stays saved in memory
     if (local && (opts.preferLocalId === item.id || item.status !== "ready")) {
       setPrepareBanner(
         item.status === "processing"
-          ? "Playing your copy — shared stream is almost ready…"
-          : "Playing your copy — uploading for the room…"
+          ? "Playing your saved copy — shared stream is processing on Mux…"
+          : "Playing your saved copy — uploading to Mux for the room…"
       );
       if (activeSrc !== local.blobUrl) {
         playLocalPreview(local.blobUrl, shouldPlay);
       } else if (shouldPlay) {
-        tryPlay();
+        tryPlay(player);
       }
       return;
     }
@@ -484,7 +537,8 @@
     dropPrompt.hidden = true;
     player.hidden = false;
     dropZone.classList.add("has-video");
-    setPrepareBanner(`“${item.name}” is preparing for the room…`);
+    if (muxPlayer) muxPlayer.hidden = true;
+    setPrepareBanner(`“${item.name}” is saving & processing for the room…`);
   }
 
   function applyState(next, opts = {}) {
@@ -503,7 +557,8 @@
         : null;
 
     const item = state.current != null ? state.queue[state.current] : null;
-    const srcKey = item?.status === "ready" && item.url ? item.url : newId;
+    const srcKey =
+      item?.status === "ready" && item.playback_id ? item.playback_id : newId;
 
     if (newId !== prevId || srcKey !== activeSrc || opts.preferLocalId) {
       loadCurrentVideo(state.position || 0, state.playing, opts);
@@ -513,49 +568,6 @@
       loadCurrentVideo(0, false);
     }
   }
-
-  player.addEventListener("play", () => {
-    if (applyingRemote) return;
-    socket.emit("play", { code, position: player.currentTime });
-  });
-
-  player.addEventListener("pause", () => {
-    if (applyingRemote) return;
-    if (player.ended) return;
-    socket.emit("pause", { code, position: player.currentTime });
-  });
-
-  player.addEventListener("seeked", () => {
-    if (applyingRemote) return;
-    socket.emit("seek", { code, position: player.currentTime });
-  });
-
-  player.addEventListener("ended", () => {
-    if (endedHandled) return;
-    endedHandled = true;
-    const item = state.current != null ? state.queue[state.current] : null;
-    if (item && localFiles.has(item.id)) {
-      const local = localFiles.get(item.id);
-      URL.revokeObjectURL(local.blobUrl);
-      localFiles.delete(item.id);
-    }
-    socket.emit("video_ended", { code, index: state.current });
-  });
-
-  positionHeartbeat = setInterval(() => {
-    if (player.hidden || !player.src) return;
-    socket.emit("sync_position", {
-      code,
-      position: player.currentTime,
-      playing: !player.paused && !player.ended,
-    });
-  }, 4000);
-
-  window.addEventListener("beforeunload", () => {
-    if (positionHeartbeat) clearInterval(positionHeartbeat);
-    Object.values(pollTimers).forEach(clearInterval);
-    destroyHls();
-  });
 
   // ---- Socket handlers ----
 
@@ -578,10 +590,11 @@
   socket.on("play", (payload) => {
     applyingRemote = true;
     try {
-      if (typeof payload.position === "number" && Math.abs(player.currentTime - payload.position) > 0.4) {
-        player.currentTime = payload.position;
+      const el = mediaEl || player;
+      if (typeof payload.position === "number" && Math.abs((el.currentTime || 0) - payload.position) > 0.4) {
+        el.currentTime = payload.position;
       }
-      player.play().catch(() => {});
+      el.play?.().catch?.(() => {});
     } finally {
       setTimeout(() => {
         applyingRemote = false;
@@ -592,10 +605,11 @@
   socket.on("pause", (payload) => {
     applyingRemote = true;
     try {
-      if (typeof payload.position === "number" && Math.abs(player.currentTime - payload.position) > 0.4) {
-        player.currentTime = payload.position;
+      const el = mediaEl || player;
+      if (typeof payload.position === "number" && Math.abs((el.currentTime || 0) - payload.position) > 0.4) {
+        el.currentTime = payload.position;
       }
-      player.pause();
+      el.pause?.();
     } finally {
       setTimeout(() => {
         applyingRemote = false;
@@ -606,8 +620,9 @@
   socket.on("seek", (payload) => {
     applyingRemote = true;
     try {
-      if (typeof payload.position === "number") player.currentTime = payload.position;
-      if (payload.playing) player.play().catch(() => {});
+      const el = mediaEl || player;
+      if (typeof payload.position === "number") el.currentTime = payload.position;
+      if (payload.playing) el.play?.().catch?.(() => {});
     } finally {
       setTimeout(() => {
         applyingRemote = false;
@@ -617,6 +632,21 @@
 
   socket.on("error", (payload) => {
     console.warn(payload?.message || "Socket error");
+  });
+
+  positionHeartbeat = setInterval(() => {
+    const el = mediaEl;
+    if (!el || el.hidden) return;
+    socket.emit("sync_position", {
+      code,
+      position: el.currentTime || 0,
+      playing: !el.paused && !el.ended,
+    });
+  }, 4000);
+
+  window.addEventListener("beforeunload", () => {
+    if (positionHeartbeat) clearInterval(positionHeartbeat);
+    Object.values(pollTimers).forEach(clearInterval);
   });
 
   renderQueue();

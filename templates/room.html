@@ -41,6 +41,13 @@
           <p class="drop-sub">You play instantly · everyone joins the shared stream when it’s ready</p>
         </div>
         <video id="player" class="player" controls playsinline preload="auto" hidden></video>
+        <mux-player
+          id="mux-player"
+          class="player mux-player"
+          stream-type="on-demand"
+          playsinline
+          hidden
+        ></mux-player>
         <div class="prepare-banner" id="prepare-banner" hidden></div>
         <div class="player-error" id="player-error" hidden>
           <p class="drop-title">Can't play this file</p>
@@ -89,7 +96,7 @@
     </section>
   </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mux/mux-player"></script>
   <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
   <script src="{{ url_for('static', filename='js/room.js') }}"></script>
 </body>
