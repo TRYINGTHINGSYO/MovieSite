@@ -464,6 +464,50 @@ a:hover {
   pointer-events: none;
 }
 
+.prepare-banner {
+  position: absolute;
+  left: 50%;
+  bottom: 18%;
+  transform: translateX(-50%);
+  z-index: 3;
+  max-width: min(90%, 36rem);
+  padding: 0.55rem 0.9rem;
+  border: 1px solid rgba(232, 184, 75, 0.35);
+  background: rgba(11, 11, 12, 0.82);
+  color: var(--ticket);
+  font-size: 0.85rem;
+  text-align: center;
+  pointer-events: none;
+}
+
+.prepare-banner[hidden] {
+  display: none !important;
+}
+
+.mux-warning {
+  margin: 0.75rem auto 0;
+  max-width: 40rem;
+  text-align: center;
+  color: #e8a0a0;
+  font-size: 0.85rem;
+}
+
+.mux-warning code {
+  font-family: var(--font-mono);
+  color: var(--gold);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--ticket);
+  border: 1px solid rgba(245, 241, 232, 0.25);
+}
+
+.btn-ghost:hover {
+  border-color: var(--gold);
+  color: var(--gold);
+}
+
 .upload-progress {
   position: absolute;
   inset: auto 10% 12%;

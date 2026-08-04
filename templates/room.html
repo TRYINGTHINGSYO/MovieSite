@@ -23,6 +23,7 @@
       <div class="ticket-perforation" aria-hidden="true"></div>
       <div class="ticket-actions">
         <button type="button" class="btn btn-sm btn-gold" id="copy-link">Copy invite link</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="download-original" hidden>Download original</button>
         <span class="copy-feedback" id="copy-feedback" hidden>Copied</span>
       </div>
     </div>
@@ -37,12 +38,13 @@
       <div class="screen-frame" id="drop-zone">
         <div class="drop-prompt" id="drop-prompt">
           <p class="drop-title">Drop a film on the screen</p>
-          <p class="drop-sub">or click to browse · any video file</p>
+          <p class="drop-sub">You play instantly · everyone joins the shared stream when it’s ready</p>
         </div>
         <video id="player" class="player" controls playsinline preload="auto" hidden></video>
+        <div class="prepare-banner" id="prepare-banner" hidden></div>
         <div class="player-error" id="player-error" hidden>
           <p class="drop-title">Can't play this file</p>
-          <p class="drop-sub" id="player-error-detail">This browser can't decode that video. Try an MP4 (H.264) export — iPhone screen recordings (.mov) are often HEVC and won't play in Chrome.</p>
+          <p class="drop-sub" id="player-error-detail">Try another video, or check Mux credentials on the server.</p>
         </div>
         <div class="upload-progress" id="upload-progress" hidden>
           <div class="upload-bar"><div class="upload-fill" id="upload-fill"></div></div>
@@ -50,6 +52,9 @@
         </div>
         <input type="file" id="file-input" accept="video/*" multiple hidden />
       </div>
+      {% if not mux_ready %}
+      <p class="mux-warning">Set <code>MUX_TOKEN_ID</code> and <code>MUX_TOKEN_SECRET</code> on Railway so shared playback works.</p>
+      {% endif %}
     </section>
 
     <div class="film-strip" aria-hidden="true">
@@ -84,6 +89,7 @@
     </section>
   </main>
 
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
   <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
   <script src="{{ url_for('static', filename='js/room.js') }}"></script>
 </body>

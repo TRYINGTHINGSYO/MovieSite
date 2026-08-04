@@ -1,12 +1,10 @@
-/* Group Theater — room client */
+/* Group Theater — room client (local preview + Mux HLS for the house) */
 
 (() => {
   const code = document.body.dataset.code;
   if (!code) return;
 
   const socket = io({
-    // Prefer WebSocket so Engine.IO does not hold HTTP workers that video
-    // Range requests need. Polling remains a fallback.
     transports: ["websocket", "polling"],
     reconnection: true,
     reconnectionAttempts: 10,
@@ -28,6 +26,8 @@
   const uploadLabel = document.getElementById("upload-label");
   const playerError = document.getElementById("player-error");
   const playerErrorDetail = document.getElementById("player-error-detail");
+  const downloadBtn = document.getElementById("download-original");
+  const prepareBanner = document.getElementById("prepare-banner");
 
   let applyingRemote = false;
   let state = {
@@ -36,15 +36,42 @@
     playing: false,
     position: 0,
     viewer_count: 1,
+    mux: true,
   };
   let endedHandled = false;
   let positionHeartbeat = null;
-  let loadFailTimer = null;
+  let hls = null;
+  let activeSrc = null;
+  let pollTimers = {};
 
-  const CODEC_HINT =
-    "This browser can't decode that video. Try an MP4 (H.264) export — iPhone screen recordings (.mov) are often HEVC and won't play in Chrome.";
-  const NETWORK_HINT =
-    "The video file didn't load from the server. Re-upload or try a smaller MP4 (H.264).";
+  // Local originals for the uploader (instant play + re-download)
+  const localFiles = new Map(); // video_id -> { file, blobUrl }
+
+  function showPlayerError(show, detail) {
+    if (!playerError) return;
+    playerError.hidden = !show;
+    if (show && playerErrorDetail && detail) {
+      playerErrorDetail.textContent = detail;
+    }
+  }
+
+  function setPrepareBanner(text) {
+    if (!prepareBanner) return;
+    if (!text) {
+      prepareBanner.hidden = true;
+      prepareBanner.textContent = "";
+      return;
+    }
+    prepareBanner.hidden = false;
+    prepareBanner.textContent = text;
+  }
+
+  function updateDownloadButton() {
+    if (!downloadBtn) return;
+    const item = state.current != null ? state.queue[state.current] : null;
+    const local = item ? localFiles.get(item.id) : null;
+    downloadBtn.hidden = !local;
+  }
 
   // ---- Invite link ----
 
@@ -66,6 +93,20 @@
     }, 1600);
   });
 
+  if (downloadBtn) {
+    downloadBtn.addEventListener("click", () => {
+      const item = state.current != null ? state.queue[state.current] : null;
+      const local = item ? localFiles.get(item.id) : null;
+      if (!local) return;
+      const a = document.createElement("a");
+      a.href = local.blobUrl;
+      a.download = local.file.name || "video";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+  }
+
   // ---- Upload / drop ----
 
   function openPicker() {
@@ -73,7 +114,7 @@
   }
 
   dropZone.addEventListener("click", (e) => {
-    if (e.target.closest("video") || e.target.closest(".btn")) return;
+    if (e.target.closest("video") || e.target.closest(".btn") || e.target.closest("a")) return;
     if (!player.hidden) return;
     openPicker();
   });
@@ -108,7 +149,6 @@
   });
 
   function uploadFiles(fileList) {
-    // Accept any dropped/picked file — no extension whitelist
     const files = [...fileList].filter((f) => f && f.size > 0);
     if (!files.length) {
       alert("Please drop a video file.");
@@ -117,102 +157,129 @@
     files.reduce((chain, file) => chain.then(() => uploadOne(file)), Promise.resolve());
   }
 
-  // Railway closes request bodies after 5 minutes — send small chunks instead.
-  const CHUNK_SIZE = 2 * 1024 * 1024;
-
-  function uploadOne(file) {
-    const uploadId =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
-    const total = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
-
+  async function uploadOne(file) {
     uploadProgress.hidden = false;
     uploadFill.style.width = "0%";
-    uploadLabel.textContent = `Uploading ${file.name}…`;
+    uploadLabel.textContent = `Preparing ${file.name}…`;
 
-    let chain = Promise.resolve();
-    for (let index = 0; index < total; index += 1) {
-      const start = index * CHUNK_SIZE;
-      const blob = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
-      chain = chain.then(() =>
-        postChunk({
-          file,
-          blob,
-          uploadId,
-          index,
-          total,
-          bytesSentBefore: start,
-        })
-      );
+    let created;
+    try {
+      const res = await fetch(`/api/mux/create-upload/${code}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name, size: file.size }),
+      });
+      created = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(created.error || `Could not start upload (${res.status})`);
+      }
+    } catch (err) {
+      uploadProgress.hidden = true;
+      alert(err.message || "Upload failed");
+      throw err;
     }
 
-    return chain
-      .then((data) => {
-        uploadProgress.hidden = true;
-        if (data?.state) applyState(data.state);
-      })
-      .catch((err) => {
-        uploadProgress.hidden = true;
-        alert(err?.message || "Upload failed.");
-        throw err;
-      });
+    const videoId = created.video_id;
+    const blobUrl = URL.createObjectURL(file);
+    localFiles.set(videoId, { file, blobUrl });
+
+    if (created.state) applyState(created.state, { preferLocalId: videoId });
+
+    // Instant local preview for the uploader
+    const idx = state.queue.findIndex((q) => q.id === videoId);
+    if (idx >= 0 && (state.current === idx || state.current === null)) {
+      playLocalPreview(blobUrl, true);
+      setPrepareBanner("Playing your copy now — preparing a shared stream for everyone…");
+    }
+
+    uploadLabel.textContent = `Uploading ${file.name}…`;
+
+    try {
+      await putToMux(created.upload_url, file);
+      uploadFill.style.width = "100%";
+      uploadLabel.textContent = "Processing for the room…";
+
+      await fetch(`/api/mux/uploaded/${code}/${videoId}`, { method: "POST" });
+      startStatusPoll(videoId);
+    } catch (err) {
+      uploadProgress.hidden = true;
+      setPrepareBanner("");
+      alert(err.message || "Upload to Mux failed");
+      throw err;
+    }
   }
 
-  function postChunk({ file, blob, uploadId, index, total, bytesSentBefore }) {
+  function putToMux(uploadUrl, file) {
     return new Promise((resolve, reject) => {
-      const form = new FormData();
-      form.append("file", blob, file.name);
-      form.append("filename", file.name);
-      form.append("upload_id", uploadId);
-      form.append("chunk_index", String(index));
-      form.append("chunk_total", String(total));
-
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", `/upload/${code}`);
-      // Each chunk should finish well under Railway's 5-minute body limit
-      xhr.timeout = 4 * 60 * 1000;
+      xhr.open("PUT", uploadUrl);
+      xhr.timeout = 60 * 60 * 1000;
+      if (file.type) xhr.setRequestHeader("Content-Type", file.type);
 
       xhr.upload.onprogress = (e) => {
         if (!e.lengthComputable) return;
-        const sent = bytesSentBefore + e.loaded;
-        const pct = Math.min(100, Math.round((sent / file.size) * 100));
+        const pct = Math.round((e.loaded / e.total) * 100);
         uploadFill.style.width = `${pct}%`;
         uploadLabel.textContent = `Uploading ${file.name}… ${pct}%`;
       };
 
       xhr.onload = () => {
-        let payload = null;
-        try {
-          payload = JSON.parse(xhr.responseText);
-        } catch {
-          /* ignore */
-        }
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(payload || { ok: true });
-          return;
-        }
-        const msg =
-          (payload && payload.error) ||
-          `Upload failed (HTTP ${xhr.status || "error"}).`;
-        reject(new Error(msg));
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(`Mux upload failed (HTTP ${xhr.status})`));
       };
-
-      xhr.onerror = () => {
-        reject(
-          new Error(
-            "Upload failed — connection dropped. Try a smaller file or check your network."
-          )
-        );
-      };
-      xhr.ontimeout = () => {
-        reject(new Error("Upload timed out. Try again on a faster connection."));
-      };
-      xhr.send(form);
+      xhr.onerror = () => reject(new Error("Network error while uploading to Mux"));
+      xhr.ontimeout = () => reject(new Error("Mux upload timed out"));
+      xhr.send(file);
     });
   }
 
+  function startStatusPoll(videoId) {
+    if (pollTimers[videoId]) clearInterval(pollTimers[videoId]);
+    let ticks = 0;
+    pollTimers[videoId] = setInterval(async () => {
+      ticks += 1;
+      try {
+        const res = await fetch(`/api/mux/status/${code}/${videoId}`);
+        const data = await res.json();
+        if (data.state) applyState(data.state);
+        const item = (data.state?.queue || state.queue).find((q) => q.id === videoId);
+        if (!item) {
+          clearInterval(pollTimers[videoId]);
+          delete pollTimers[videoId];
+          return;
+        }
+        if (item.status === "ready") {
+          clearInterval(pollTimers[videoId]);
+          delete pollTimers[videoId];
+          uploadProgress.hidden = true;
+          setPrepareBanner("");
+        } else if (item.status === "error") {
+          clearInterval(pollTimers[videoId]);
+          delete pollTimers[videoId];
+          uploadProgress.hidden = true;
+          setPrepareBanner("");
+          showPlayerError(true, item.error || "Mux could not process this video.");
+        } else if (ticks > 180) {
+          clearInterval(pollTimers[videoId]);
+          delete pollTimers[videoId];
+          uploadProgress.hidden = true;
+          setPrepareBanner("Still processing — the room will update when ready.");
+        }
+      } catch {
+        /* keep polling */
+      }
+    }, 2000);
+  }
+
   // ---- Queue UI ----
+
+  function statusLabel(item) {
+    if (item.status === "ready") return "";
+    if (item.status === "uploading") return " · uploading";
+    if (item.status === "processing") return " · processing";
+    if (item.status === "error") return " · error";
+    return item.status ? ` · ${item.status}` : "";
+  }
 
   function renderQueue() {
     queueList.querySelectorAll(".queue-item").forEach((el) => el.remove());
@@ -228,8 +295,10 @@
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "queue-item" + (state.current === index ? " active" : "");
-      btn.innerHTML = `<span class="queue-index">${String(index + 1).padStart(2, "0")}</span><span class="queue-name"></span>`;
-      btn.querySelector(".queue-name").textContent = item.name;
+      btn.innerHTML =
+        `<span class="queue-index">${String(index + 1).padStart(2, "0")}</span>` +
+        `<span class="queue-name"></span>`;
+      btn.querySelector(".queue-name").textContent = `${item.name}${statusLabel(item)}`;
       btn.addEventListener("click", () => {
         socket.emit("select_video", { code, index });
       });
@@ -237,8 +306,6 @@
       queueList.appendChild(li);
     });
   }
-
-  // ---- Seats / presence ----
 
   function updateSeats(count) {
     const n = Math.max(0, Math.min(seats.length, count | 0));
@@ -252,7 +319,14 @@
     updateSeats(count);
   }
 
-  // ---- Player / sync ----
+  // ---- Player ----
+
+  function destroyHls() {
+    if (hls) {
+      hls.destroy();
+      hls = null;
+    }
+  }
 
   function tryPlay() {
     const p = player.play();
@@ -269,192 +343,166 @@
     }
   }
 
-  function showPlayerError(show, detail) {
-    if (!playerError) return;
-    playerError.hidden = !show;
-    if (show && playerErrorDetail && detail) {
-      playerErrorDetail.textContent = detail;
-    }
-  }
-
-  function clearLoadFailTimer() {
-    if (loadFailTimer) {
-      clearTimeout(loadFailTimer);
-      clearInterval(loadFailTimer);
-      loadFailTimer = null;
-    }
-  }
-
-  function mediaErrorHint() {
-    const err = player.error;
-    const name = (state.queue[state.current]?.name || "").toLowerCase();
-    if (err && err.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
-      return CODEC_HINT;
-    }
-    if (err && (err.code === MediaError.MEDIA_ERR_NETWORK || err.code === MediaError.MEDIA_ERR_ABORTED)) {
-      return NETWORK_HINT;
-    }
-    if (name.endsWith(".mov") || name.endsWith(".mkv") || name.endsWith(".avi")) {
-      return CODEC_HINT;
-    }
-    return CODEC_HINT;
-  }
-
-  player.addEventListener("error", () => {
-    clearLoadFailTimer();
-    showPlayerError(true, mediaErrorHint());
-  });
-
-  player.addEventListener("playing", () => {
-    clearLoadFailTimer();
+  function playLocalPreview(blobUrl, shouldPlay) {
+    destroyHls();
+    dropPrompt.hidden = true;
+    player.hidden = false;
+    dropZone.classList.add("has-video");
     showPlayerError(false);
-  });
+    activeSrc = blobUrl;
+    player.src = blobUrl;
+    player.load();
+    if (shouldPlay) tryPlay();
+    updateDownloadButton();
+  }
 
-  player.addEventListener("loadeddata", () => {
+  function attachHls(url, seekTo, shouldPlay) {
+    destroyHls();
+    dropPrompt.hidden = true;
+    player.hidden = false;
+    dropZone.classList.add("has-video");
     showPlayerError(false);
-  });
+    endedHandled = false;
+    activeSrc = url;
 
-  function loadCurrentVideo(seekTo, shouldPlay) {
-    clearLoadFailTimer();
-    if (state.current === null || !state.queue[state.current]) {
+    const afterReady = () => {
+      applyingRemote = true;
+      try {
+        if (typeof seekTo === "number" && seekTo > 0.35) {
+          player.currentTime = seekTo;
+        }
+        if (shouldPlay) tryPlay();
+        else player.pause();
+      } finally {
+        setTimeout(() => {
+          applyingRemote = false;
+        }, 150);
+      }
+    };
+
+    if (player.canPlayType("application/vnd.apple.mpegurl")) {
+      player.src = url;
+      player.addEventListener("loadedmetadata", afterReady, { once: true });
+      player.addEventListener(
+        "error",
+        () => showPlayerError(true, "Could not play the shared stream."),
+        { once: true }
+      );
+      player.load();
+      return;
+    }
+
+    if (typeof Hls !== "undefined" && Hls.isSupported()) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+      });
+      hls.loadSource(url);
+      hls.attachMedia(player);
+      hls.on(Hls.Events.MANIFEST_PARSED, afterReady);
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (data?.fatal) {
+          showPlayerError(true, "Shared stream error — try re-adding the video.");
+        }
+      });
+      return;
+    }
+
+    showPlayerError(true, "This browser cannot play HLS video.");
+  }
+
+  function loadCurrentVideo(seekTo, shouldPlay, opts = {}) {
+    const item = state.current != null ? state.queue[state.current] : null;
+    if (!item) {
+      destroyHls();
       player.hidden = true;
       player.removeAttribute("src");
       player.load();
       dropPrompt.hidden = false;
       dropZone.classList.remove("has-video");
       showPlayerError(false);
+      setPrepareBanner("");
+      activeSrc = null;
+      updateDownloadButton();
       return;
     }
 
-    const item = state.queue[state.current];
-    const nextSrc = item.url;
-    const needsReload = player.getAttribute("src") !== nextSrc;
+    updateDownloadButton();
+    const local = localFiles.get(item.id);
 
+    // Prefer shared Mux HLS when ready so everyone watches the same stream.
+    if (item.status === "ready" && item.url) {
+      setPrepareBanner("");
+      uploadProgress.hidden = true;
+      if (activeSrc === item.url) {
+        applyingRemote = true;
+        try {
+          if (typeof seekTo === "number" && Math.abs(player.currentTime - seekTo) > 0.75) {
+            player.currentTime = seekTo;
+          }
+          if (shouldPlay && player.paused) tryPlay();
+          if (!shouldPlay && !player.paused) player.pause();
+        } finally {
+          setTimeout(() => {
+            applyingRemote = false;
+          }, 80);
+        }
+        return;
+      }
+      attachHls(item.url, seekTo || 0, shouldPlay);
+      return;
+    }
+
+    if (item.status === "error") {
+      showPlayerError(true, item.error || "This video failed to process.");
+      setPrepareBanner("");
+      return;
+    }
+
+    // Host local preview while uploading/processing
+    if (local && (opts.preferLocalId === item.id || item.status !== "ready")) {
+      setPrepareBanner(
+        item.status === "processing"
+          ? "Playing your copy — shared stream is almost ready…"
+          : "Playing your copy — uploading for the room…"
+      );
+      if (activeSrc !== local.blobUrl) {
+        playLocalPreview(local.blobUrl, shouldPlay);
+      } else if (shouldPlay) {
+        tryPlay();
+      }
+      return;
+    }
+
+    // Guests waiting on Mux
     dropPrompt.hidden = true;
     player.hidden = false;
     dropZone.classList.add("has-video");
-    endedHandled = false;
-    showPlayerError(false);
-
-    const afterReady = () => {
-      applyingRemote = true;
-      try {
-        // Avoid seek(0) before buffer exists — it triggers extra Range churn.
-        if (
-          typeof seekTo === "number" &&
-          !Number.isNaN(seekTo) &&
-          seekTo > 0.5 &&
-          Math.abs(player.currentTime - seekTo) > 0.4
-        ) {
-          player.currentTime = seekTo;
-        }
-        if (shouldPlay) {
-          tryPlay();
-        } else {
-          player.pause();
-        }
-      } finally {
-        setTimeout(() => {
-          applyingRemote = false;
-        }, 120);
-      }
-    };
-
-    if (needsReload) {
-      player.src = nextSrc;
-      // Duration can appear (metadata) while media bytes still stall — wait for canplay.
-      let lastBuffered = 0;
-      let stallTicks = 0;
-      const onCanPlay = () => {
-        clearLoadFailTimer();
-        afterReady();
-      };
-      player.addEventListener("canplay", onCanPlay, { once: true });
-
-      // Poll buffer growth for large files instead of a single short timeout.
-      loadFailTimer = setInterval(() => {
-        if (player.readyState >= 3 || (!player.paused && !player.ended && player.currentTime > 0.1)) {
-          clearLoadFailTimer();
-          player.removeEventListener("canplay", onCanPlay);
-          afterReady();
-          return;
-        }
-        let bufferedEnd = 0;
-        try {
-          if (player.buffered.length) {
-            bufferedEnd = player.buffered.end(player.buffered.length - 1);
-          }
-        } catch {
-          /* ignore */
-        }
-        if (bufferedEnd > lastBuffered + 0.05) {
-          lastBuffered = bufferedEnd;
-          stallTicks = 0;
-          showPlayerError(false);
-          return;
-        }
-        stallTicks += 1;
-        // ~30s with no buffer growth after metadata → surface error
-        if (stallTicks >= 15 && player.readyState >= 1) {
-          clearLoadFailTimer();
-          player.removeEventListener("canplay", onCanPlay);
-          showPlayerError(true, NETWORK_HINT);
-        } else if (stallTicks >= 20 && player.readyState < 1) {
-          clearLoadFailTimer();
-          player.removeEventListener("canplay", onCanPlay);
-          showPlayerError(true, mediaErrorHint());
-        }
-      }, 2000);
-
-      player.addEventListener(
-        "error",
-        () => {
-          clearLoadFailTimer();
-          player.removeEventListener("canplay", onCanPlay);
-          showPlayerError(true, mediaErrorHint());
-        },
-        { once: true }
-      );
-      player.load();
-    } else {
-      afterReady();
-    }
+    setPrepareBanner(`“${item.name}” is preparing for the room…`);
   }
 
-  function applyState(next) {
-    const prevCurrent = state.current;
-    const prevSrc =
-      state.current !== null && state.queue[state.current]
-        ? state.queue[state.current].url
+  function applyState(next, opts = {}) {
+    const prevId =
+      state.current != null && state.queue[state.current]
+        ? state.queue[state.current].id
         : null;
 
     state = { ...state, ...next };
     renderQueue();
-    if (typeof next.viewer_count === "number") {
-      setViewerCount(next.viewer_count);
-    }
+    if (typeof next.viewer_count === "number") setViewerCount(next.viewer_count);
 
-    const newSrc =
-      state.current !== null && state.queue[state.current]
-        ? state.queue[state.current].url
+    const newId =
+      state.current != null && state.queue[state.current]
+        ? state.queue[state.current].id
         : null;
 
-    if (newSrc !== prevSrc || state.current !== prevCurrent) {
-      loadCurrentVideo(state.position || 0, state.playing);
-    } else if (newSrc) {
-      // Same video — nudge play/pause/position if needed
-      applyingRemote = true;
-      try {
-        if (Math.abs(player.currentTime - (state.position || 0)) > 0.75) {
-          player.currentTime = state.position || 0;
-        }
-        if (state.playing && player.paused) player.play().catch(() => {});
-        if (!state.playing && !player.paused) player.pause();
-      } finally {
-        setTimeout(() => {
-          applyingRemote = false;
-        }, 80);
-      }
+    const item = state.current != null ? state.queue[state.current] : null;
+    const srcKey = item?.status === "ready" && item.url ? item.url : newId;
+
+    if (newId !== prevId || srcKey !== activeSrc || opts.preferLocalId) {
+      loadCurrentVideo(state.position || 0, state.playing, opts);
+    } else if (item) {
+      loadCurrentVideo(state.position || 0, state.playing, opts);
     } else {
       loadCurrentVideo(0, false);
     }
@@ -471,10 +519,6 @@
     socket.emit("pause", { code, position: player.currentTime });
   });
 
-  player.addEventListener("seeking", () => {
-    if (applyingRemote) return;
-  });
-
   player.addEventListener("seeked", () => {
     if (applyingRemote) return;
     socket.emit("seek", { code, position: player.currentTime });
@@ -483,10 +527,15 @@
   player.addEventListener("ended", () => {
     if (endedHandled) return;
     endedHandled = true;
+    const item = state.current != null ? state.queue[state.current] : null;
+    if (item && localFiles.has(item.id)) {
+      const local = localFiles.get(item.id);
+      URL.revokeObjectURL(local.blobUrl);
+      localFiles.delete(item.id);
+    }
     socket.emit("video_ended", { code, index: state.current });
   });
 
-  // Quiet position heartbeat so late joiners land near the right frame
   positionHeartbeat = setInterval(() => {
     if (player.hidden || !player.src) return;
     socket.emit("sync_position", {
@@ -498,6 +547,8 @@
 
   window.addEventListener("beforeunload", () => {
     if (positionHeartbeat) clearInterval(positionHeartbeat);
+    Object.values(pollTimers).forEach(clearInterval);
+    destroyHls();
   });
 
   // ---- Socket handlers ----
@@ -506,15 +557,10 @@
     socket.emit("join", { code });
   });
 
-  socket.on("state_sync", (payload) => {
-    applyState(payload);
-  });
-
-  socket.on("queue_updated", (payload) => {
-    applyState(payload);
-  });
-
+  socket.on("state_sync", (payload) => applyState(payload));
+  socket.on("queue_updated", (payload) => applyState(payload));
   socket.on("video_selected", (payload) => {
+    endedHandled = false;
     applyState(payload);
   });
 
@@ -526,10 +572,8 @@
   socket.on("play", (payload) => {
     applyingRemote = true;
     try {
-      if (typeof payload.position === "number") {
-        if (Math.abs(player.currentTime - payload.position) > 0.4) {
-          player.currentTime = payload.position;
-        }
+      if (typeof payload.position === "number" && Math.abs(player.currentTime - payload.position) > 0.4) {
+        player.currentTime = payload.position;
       }
       player.play().catch(() => {});
     } finally {
@@ -542,10 +586,8 @@
   socket.on("pause", (payload) => {
     applyingRemote = true;
     try {
-      if (typeof payload.position === "number") {
-        if (Math.abs(player.currentTime - payload.position) > 0.4) {
-          player.currentTime = payload.position;
-        }
+      if (typeof payload.position === "number" && Math.abs(player.currentTime - payload.position) > 0.4) {
+        player.currentTime = payload.position;
       }
       player.pause();
     } finally {
@@ -558,12 +600,8 @@
   socket.on("seek", (payload) => {
     applyingRemote = true;
     try {
-      if (typeof payload.position === "number") {
-        player.currentTime = payload.position;
-      }
-      if (payload.playing) {
-        player.play().catch(() => {});
-      }
+      if (typeof payload.position === "number") player.currentTime = payload.position;
+      if (payload.playing) player.play().catch(() => {});
     } finally {
       setTimeout(() => {
         applyingRemote = false;
@@ -575,7 +613,7 @@
     console.warn(payload?.message || "Socket error");
   });
 
-  // Initial empty queue render
   renderQueue();
   updateSeats(1);
+  updateDownloadButton();
 })();
