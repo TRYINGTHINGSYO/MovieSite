@@ -171,7 +171,11 @@
       });
       created = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(created.error || `Could not start upload (${res.status})`);
+        throw new Error(
+          created.error ||
+            created.detail ||
+            `Could not start upload (${res.status})`
+        );
       }
     } catch (err) {
       uploadProgress.hidden = true;

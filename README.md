@@ -4,12 +4,15 @@ Synced watch-party rooms. Uploads go to **Mux** (transcoded HLS) so everyone get
 
 ## Railway setup
 
-1. Create a free Mux account → Access Tokens → create token with **Mux Video** write permissions.
-2. On the Railway service, set:
-   - `MUX_TOKEN_ID`
-   - `MUX_TOKEN_SECRET`
-   - `SECRET_KEY` (any long random string)
-3. Deploy from `main`. Start command is already in `railway.json` (gunicorn gthread).
+1. In Mux dashboard go to **Settings → Access Tokens** (not Mux Data).
+2. Create a token with **Mux Video — Read** and **Write**.
+3. On the Railway service Variables, set:
+   - `MUX_TOKEN_ID` = Token ID (UUID-looking)
+   - `MUX_TOKEN_SECRET` = Token Secret (long string)
+   - `SECRET_KEY` = any long random string
+4. Redeploy. Check `https://YOUR-APP.up.railway.app/api/mux/health` — should return `{"ok": true}`.
+
+Do **not** use the Mux Data “environment key” (from the player/analytics setup screen). That is not an API access token.
 
 ## Local run
 

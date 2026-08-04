@@ -209,6 +209,32 @@ def session_room(code: str):
     )
 
 
+def mux_error_message(resp: requests.Response) -> str:
+    """Turn a Mux HTTP error into something a human can act on."""
+    status = resp.status_code
+    body = ""
+    try:
+        payload = resp.json()
+        err = payload.get("error") or {}
+        if isinstance(err, dict):
+            body = err.get("messages") or err.get("message") or ""
+            if isinstance(body, list):
+                body = "; ".join(str(x) for x in body)
+        if not body:
+            body = resp.text[:300]
+    except Exception:
+        body = resp.text[:300]
+
+    if status in (401, 403):
+        return (
+            f"Mux auth failed (HTTP {status}). On Railway set MUX_TOKEN_ID and "
+            "MUX_TOKEN_SECRET from Mux → Settings → Access Tokens (Video Read+Write). "
+            "Do not use the Mux Data environment key. "
+            f"Details: {body or 'unauthorized'}"
+        )
+    return f"Mux rejected the upload (HTTP {status}): {body or resp.reason}"
+
+
 @app.route("/api/mux/create-upload/<code>", methods=["POST"])
 def create_mux_upload(code: str):
     """Create a Mux Direct Upload URL for the browser to PUT the file to."""
@@ -219,7 +245,7 @@ def create_mux_upload(code: str):
         return {
             "error": (
                 "Mux is not configured. Set MUX_TOKEN_ID and MUX_TOKEN_SECRET "
-                "on the Railway service, then redeploy."
+                "on the Railway service (Mux → Settings → Access Tokens), then redeploy."
             )
         }, 503
 
@@ -227,15 +253,14 @@ def create_mux_upload(code: str):
     original = secure_filename(body.get("filename") or "video") or "video"
     video_id = uuid.uuid4().hex[:12]
 
-    # Prefer the request Origin so browser CORS on the signed URL works.
-    cors_origin = request.headers.get("Origin") or os.environ.get(
-        "PUBLIC_ORIGIN", "*"
-    )
+    # "*" is valid for direct uploads and avoids Origin mismatch with Railway URLs.
+    cors_origin = os.environ.get("MUX_CORS_ORIGIN", "*").strip() or "*"
 
     try:
         resp = requests.post(
             f"{MUX_API}/uploads",
             auth=mux_auth(),
+            headers={"Content-Type": "application/json"},
             json={
                 "cors_origin": cors_origin,
                 "timeout": 3600,
@@ -251,10 +276,7 @@ def create_mux_upload(code: str):
         return {"error": f"Mux request failed: {exc}"}, 502
 
     if not resp.ok:
-        return {
-            "error": "Mux rejected the upload request",
-            "detail": resp.text[:500],
-        }, 502
+        return {"error": mux_error_message(resp), "status": resp.status_code}, 502
 
     data = (resp.json() or {}).get("data") or {}
     upload_url = data.get("url")
@@ -325,6 +347,27 @@ def mux_status(code: str, video_id: str):
 @app.route("/api/config", methods=["GET"])
 def api_config():
     return {"mux": mux_configured()}
+
+
+@app.route("/api/mux/health", methods=["GET"])
+def mux_health():
+    """Quick check that Railway credentials can talk to Mux Video."""
+    if not mux_configured():
+        return {
+            "ok": False,
+            "error": "MUX_TOKEN_ID / MUX_TOKEN_SECRET not set on Railway",
+        }, 503
+    try:
+        resp = requests.get(
+            f"{MUX_API}/uploads?limit=1",
+            auth=mux_auth(),
+            timeout=20,
+        )
+    except requests.RequestException as exc:
+        return {"ok": False, "error": str(exc)}, 502
+    if resp.ok:
+        return {"ok": True}
+    return {"ok": False, "error": mux_error_message(resp)}, 502
 
 
 # ---------------------------------------------------------------------------
