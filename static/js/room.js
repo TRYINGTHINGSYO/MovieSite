@@ -409,6 +409,9 @@
     const same = activePlaybackId === playbackId;
     activePlaybackId = playbackId;
     activeSrc = playbackId;
+    muxPlayer.primaryColor = "#F5F1E8";
+    muxPlayer.secondaryColor = "rgba(14, 14, 16, 0.82)";
+    muxPlayer.accentColor = "#E8B84B";
     muxPlayer.playbackId = playbackId;
     muxPlayer.setAttribute("playback-id", playbackId);
 

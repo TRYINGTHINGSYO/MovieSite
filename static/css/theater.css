@@ -444,8 +444,39 @@ a:hover {
 }
 
 .mux-player {
-  --controls: inline;
+  /* Theater theme — tweak these to restyle the control bar */
+  --player-accent: var(--gold);
+  --player-icons: var(--ticket);
+  --player-bar: rgba(14, 14, 16, 0.82);
+  --player-backdrop: rgba(11, 11, 12, 0.35);
+
   --media-object-fit: contain;
+  --media-object-position: center;
+  --controls-backdrop-color: var(--player-backdrop);
+
+  /* Clean bottom bar only — hide the stacked center overlay controls */
+  --center-controls: none;
+  --center-play-button: none;
+  --center-seek-forward-button: none;
+  --center-seek-backward-button: none;
+  --center-mute-button: none;
+
+  /* Slimmer chrome */
+  --pip-button: none;
+  --cast-button: none;
+  --airplay-button: none;
+  --playback-rate-button: none;
+  --rendition-menu-button: none;
+  --captions-button: none;
+  --seek-backward-button: none;
+  --seek-forward-button: none;
+}
+
+/* Keep bottom transport: play, mute, timeline, fullscreen */
+.mux-player::part(bottom play button),
+.mux-player::part(bottom mute button),
+.mux-player::part(bottom fullscreen button) {
+  color: var(--player-icons);
 }
 
 .player[hidden],
