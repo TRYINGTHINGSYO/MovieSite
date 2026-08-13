@@ -804,3 +804,166 @@ a:hover {
     flex-direction: column;
   }
 }
+
+/* Accounts and saved rooms */
+
+.account-actions {
+  gap: 0.75rem;
+}
+
+.account-panel {
+  max-width: 460px;
+}
+
+.account-brand {
+  font-size: clamp(2.8rem, 10vw, 4.5rem);
+  margin-bottom: 1.5rem;
+}
+
+.account-form {
+  display: grid;
+  gap: 1rem;
+  text-align: left;
+}
+
+.account-form label,
+.room-action-card label {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.account-form label span {
+  font-weight: 400;
+}
+
+.account-form input,
+.room-action-card input {
+  width: 100%;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid rgba(232, 184, 75, 0.35);
+  background: rgba(245, 241, 232, 0.06);
+  color: var(--ticket);
+  font: inherit;
+}
+
+.account-form input:focus,
+.room-action-card input:focus {
+  outline: none;
+  border-color: var(--gold);
+  box-shadow: 0 0 0 3px rgba(232, 184, 75, 0.15);
+}
+
+.account-switch {
+  margin-top: 1.5rem;
+  color: var(--muted);
+}
+
+.dashboard-header,
+.dashboard {
+  position: relative;
+  z-index: 2;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+.dashboard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.5rem 1rem;
+}
+
+.dashboard-user {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.dashboard-user form {
+  margin: 0;
+}
+
+.dashboard {
+  padding: 2rem 1rem 4rem;
+}
+
+.dashboard-title {
+  margin: 0 0 2rem;
+  font-family: var(--font-display);
+  font-size: clamp(3rem, 10vw, 5rem);
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+
+.dashboard-actions {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+
+.room-action-card {
+  padding: 1.25rem;
+  border: 1px solid rgba(245, 241, 232, 0.12);
+  background: rgba(245, 241, 232, 0.04);
+}
+
+.room-action-card label {
+  margin-bottom: 0.65rem;
+}
+
+.room-action-card .code-input {
+  font-family: var(--font-mono);
+}
+
+.saved-room-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.saved-room {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.25rem;
+  border-left: 3px solid var(--gold);
+  background: rgba(245, 241, 232, 0.06);
+  color: var(--ticket);
+}
+
+.saved-room:hover {
+  background: rgba(245, 241, 232, 0.1);
+  text-decoration: none;
+}
+
+.saved-room span {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.saved-room small,
+.rooms-empty {
+  color: var(--muted);
+}
+
+.saved-room code {
+  color: var(--gold);
+  font-family: var(--font-mono);
+  letter-spacing: 0.12em;
+}
+
+@media (max-width: 650px) {
+  .dashboard-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-user > span {
+    display: none;
+  }
+}

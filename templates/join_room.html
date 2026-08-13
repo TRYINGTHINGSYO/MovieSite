@@ -1,0 +1,5 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Join {{ room.name }} · Group Theater</title><link rel="stylesheet" href="{{ url_for('static', filename='css/theater.css') }}" /></head>
+<body class="page-landing"><div class="ambient" aria-hidden="true"></div><main class="landing account-panel"><p class="eyebrow">Room invitation</p><h1 class="brand account-brand">{{ room.name }}</h1><p class="tagline">Join this room to save it to your account.</p><form action="{{ url_for('join_session') }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}" /><input type="hidden" name="code" value="{{ room.code }}" /><button class="btn btn-gold btn-lg" type="submit">Join room</button></form><p class="account-switch"><a href="{{ url_for('saved_rooms') }}">Back to saved rooms</a></p></main></body>
+</html>

@@ -17,7 +17,7 @@
   <main class="landing">
     <p class="eyebrow">Now playing · private rooms</p>
     <h1 class="brand">Group Theater</h1>
-    <p class="tagline">Spin up a room, share the code, drop a film — everyone watches in sync.</p>
+    <p class="tagline">Create an account, save your rooms, and keep every watch party ready for the next showing.</p>
 
     {% with messages = get_flashed_messages() %}
       {% if messages %}
@@ -29,28 +29,9 @@
       {% endif %}
     {% endwith %}
 
-    <div class="landing-actions">
-      <form action="{{ url_for('create_session') }}" method="post">
-        <button type="submit" class="btn btn-gold btn-lg">Create a session</button>
-      </form>
-
-      <div class="join-panel">
-        <p class="join-label">Already have a ticket?</p>
-        <form class="join-form" action="{{ url_for('join_session') }}" method="post">
-          <input
-            type="text"
-            name="code"
-            class="code-input"
-            placeholder="7F3K2"
-            maxlength="8"
-            autocomplete="off"
-            spellcheck="false"
-            aria-label="Session code"
-            required
-          />
-          <button type="submit" class="btn btn-velvet">Join with code</button>
-        </form>
-      </div>
+    <div class="landing-actions account-actions">
+      <a href="{{ url_for('register') }}" class="btn btn-gold btn-lg">Create an account</a>
+      <a href="{{ url_for('login') }}" class="btn btn-velvet btn-lg">Sign in</a>
     </div>
   </main>
 </body>

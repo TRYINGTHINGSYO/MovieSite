@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Create account · Group Theater</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theater.css') }}" />
+</head>
+<body class="page-landing">
+  <div class="ambient" aria-hidden="true"></div>
+  <main class="landing account-panel">
+    <p class="eyebrow">Admit one</p>
+    <h1 class="brand account-brand">Create account</h1>
+    {% with messages = get_flashed_messages() %}{% if messages %}<ul class="flash" role="alert">{% for message in messages %}<li>{{ message }}</li>{% endfor %}</ul>{% endif %}{% endwith %}
+    <form method="post" class="account-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+      <label>Display name <span>(optional)</span><input type="text" name="display_name" maxlength="80" autocomplete="name" /></label>
+      <label>Email<input type="email" name="email" autocomplete="email" required /></label>
+      <label>Password <span>(10 characters minimum)</span><input type="password" name="password" minlength="10" autocomplete="new-password" required /></label>
+      <button class="btn btn-gold btn-lg" type="submit">Create account</button>
+    </form>
+    <p class="account-switch">Already have an account? <a href="{{ url_for('login') }}">Sign in</a></p>
+  </main>
+</body>
+</html>

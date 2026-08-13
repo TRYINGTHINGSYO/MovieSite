@@ -3,6 +3,7 @@
 (() => {
   const code = document.body.dataset.code;
   if (!code) return;
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
 
   const socket = io({
     transports: ["websocket", "polling"],
@@ -190,7 +191,7 @@
     try {
       const res = await fetch(`/api/mux/create-upload/${code}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-CSRFToken": csrfToken },
         body: JSON.stringify({ filename: file.name, size: file.size }),
       });
       created = await res.json().catch(() => ({}));
@@ -227,7 +228,10 @@
       uploadFill.style.width = "100%";
       uploadLabel.textContent = "Processing for the room…";
 
-      await fetch(`/api/mux/uploaded/${code}/${videoId}`, { method: "POST" });
+      await fetch(`/api/mux/uploaded/${code}/${videoId}`, {
+        method: "POST",
+        headers: { "X-CSRFToken": csrfToken },
+      });
       startStatusPoll(videoId);
     } catch (err) {
       uploadProgress.hidden = true;
@@ -382,7 +386,7 @@
       endedHandled = true;
       const item = state.current != null ? state.queue[state.current] : null;
       // Keep local original available for download until room advances
-      socket.emit("video_ended", { code, index: state.current });
+      socket.emit("video_ended", { code, index: state.current, video_id: item?.id });
     });
   }
 

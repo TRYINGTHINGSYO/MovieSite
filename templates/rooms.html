@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Your rooms · Group Theater</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/theater.css') }}" />
+</head>
+<body class="page-room">
+  <div class="ambient ambient-room" aria-hidden="true"></div>
+  <header class="dashboard-header">
+    <a class="brand-mini" href="{{ url_for('saved_rooms') }}">Group Theater</a>
+    <div class="dashboard-user">
+      <span>{{ current_user.display_name or current_user.email }}</span>
+      <form action="{{ url_for('logout') }}" method="post"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}" /><button class="btn btn-sm btn-ghost" type="submit">Sign out</button></form>
+    </div>
+  </header>
+  <main class="dashboard">
+    <p class="eyebrow">Your screenings</p>
+    <h1 class="dashboard-title">Saved rooms</h1>
+    {% with messages = get_flashed_messages() %}{% if messages %}<ul class="flash" role="alert">{% for message in messages %}<li>{{ message }}</li>{% endfor %}</ul>{% endif %}{% endwith %}
+    <section class="dashboard-actions">
+      <form action="{{ url_for('create_session') }}" method="post" class="room-action-card">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+        <label for="room-name">Create a room</label>
+        <div class="join-form"><input id="room-name" name="name" maxlength="120" placeholder="Friday night movies" /><button class="btn btn-gold" type="submit">Create</button></div>
+      </form>
+      <form action="{{ url_for('join_session') }}" method="post" class="room-action-card">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+        <label for="room-code">Join with a code</label>
+        <div class="join-form"><input id="room-code" name="code" class="code-input" maxlength="8" placeholder="7F3K2ABC" required /><button class="btn btn-velvet" type="submit">Join</button></div>
+      </form>
+    </section>
+    <section class="saved-room-list">
+      {% for membership in memberships %}
+      <a class="saved-room" href="{{ url_for('session_room', code=membership.room.code) }}">
+        <span><strong>{{ membership.room.name }}</strong><small>{{ 'Owner' if membership.room.owner_id == current_user.id else 'Member' }}</small></span>
+        <code>{{ membership.room.code }}</code>
+      </a>
+      {% else %}
+      <p class="rooms-empty">No saved rooms yet. Create one or join with an invite code.</p>
+      {% endfor %}
+    </section>
+  </main>
+</body>
+</html>

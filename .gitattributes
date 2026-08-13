@@ -1,0 +1,7 @@
+*.py whitespace=cr-at-eol
+*.html whitespace=cr-at-eol
+*.css whitespace=cr-at-eol
+*.js whitespace=cr-at-eol
+*.json whitespace=cr-at-eol
+*.md whitespace=cr-at-eol
+requirements*.txt whitespace=cr-at-eol

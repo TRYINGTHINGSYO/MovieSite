@@ -1,6 +1,7 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
   "deploy": {
+    "preDeployCommand": "flask --app movie_theater.py db upgrade",
     "startCommand": "gunicorn -w 1 --worker-class gthread --threads 100 --bind 0.0.0.0:$PORT --timeout 300 --keep-alive 5 movie_theater:app"
   }
 }
