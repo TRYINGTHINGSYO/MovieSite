@@ -1,7 +1,7 @@
 from models import db
 from movie_theater import socketio
 
-from test_rooms import create_room
+from test_rooms import add_ready_media, create_room
 
 
 def test_unauthenticated_socket_connection_is_rejected(app, client):
@@ -28,10 +28,14 @@ def test_socket_room_join_requires_membership(app, client, register):
 def test_socket_playback_state_is_persisted(app, client, register):
     register()
     code = create_room(client)
+    add_ready_media(app, code)
     socket_client = socketio.test_client(app, flask_test_client=client)
     socket_client.emit("join", {"code": code})
     socket_client.get_received()
-    socket_client.emit("play", {"code": code, "position": 12.5})
+    socket_client.emit(
+        "play",
+        {"code": code, "position": 12.5, "expected_playback_version": 1},
+    )
 
     from models import WatchRoom
 

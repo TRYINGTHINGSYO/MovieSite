@@ -40,9 +40,10 @@
     position: 0,
     viewer_count: 1,
     mux: true,
+    queue_version: 0,
+    playback_version: 0,
   };
   let endedHandled = false;
-  let positionHeartbeat = null;
   let activeSrc = null;
   let activePlaybackId = null;
   let pollTimers = {};
@@ -100,7 +101,11 @@
             applyingRemote = false;
           }, 120);
         });
-      socket.emit("play", { code, position: el.currentTime || 0 });
+      socket.emit("play", {
+        code,
+        position: el.currentTime || 0,
+        expected_playback_version: state.playback_version,
+      });
     });
   }
 
@@ -344,7 +349,11 @@
         `<span class="queue-name"></span>`;
       btn.querySelector(".queue-name").textContent = `${item.name}${statusLabel(item)}`;
       btn.addEventListener("click", () => {
-        socket.emit("select_video", { code, index });
+        socket.emit("select_video", {
+          code,
+          queue_entry_id: item.id,
+          expected_playback_version: state.playback_version,
+        });
       });
       li.appendChild(btn);
       queueList.appendChild(li);
@@ -370,23 +379,39 @@
     el._theaterBound = true;
     el.addEventListener("play", () => {
       if (applyingRemote) return;
-      socket.emit("play", { code, position: el.currentTime || 0 });
+      socket.emit("play", {
+        code,
+        position: el.currentTime || 0,
+        expected_playback_version: state.playback_version,
+      });
     });
     el.addEventListener("pause", () => {
       if (applyingRemote) return;
       if (el.ended) return;
-      socket.emit("pause", { code, position: el.currentTime || 0 });
+      socket.emit("pause", {
+        code,
+        position: el.currentTime || 0,
+        expected_playback_version: state.playback_version,
+      });
     });
     el.addEventListener("seeked", () => {
       if (applyingRemote) return;
-      socket.emit("seek", { code, position: el.currentTime || 0 });
+      socket.emit("seek", {
+        code,
+        position: el.currentTime || 0,
+        expected_playback_version: state.playback_version,
+      });
     });
     el.addEventListener("ended", () => {
       if (endedHandled) return;
       endedHandled = true;
       const item = state.current != null ? state.queue[state.current] : null;
       // Keep local original available for download until room advances
-      socket.emit("video_ended", { code, index: state.current, video_id: item?.id });
+      socket.emit("video_ended", {
+        code,
+        video_id: item?.id,
+        expected_playback_version: state.playback_version,
+      });
     });
   }
 
@@ -659,6 +684,9 @@
   });
 
   socket.on("play", (payload) => {
+    if (typeof payload.playback_version === "number") {
+      state.playback_version = payload.playback_version;
+    }
     applyingRemote = true;
     try {
       const el = mediaEl || muxPlayer || player;
@@ -677,6 +705,9 @@
   });
 
   socket.on("pause", (payload) => {
+    if (typeof payload.playback_version === "number") {
+      state.playback_version = payload.playback_version;
+    }
     applyingRemote = true;
     try {
       const el = mediaEl || player;
@@ -692,6 +723,9 @@
   });
 
   socket.on("seek", (payload) => {
+    if (typeof payload.playback_version === "number") {
+      state.playback_version = payload.playback_version;
+    }
     applyingRemote = true;
     try {
       const el = mediaEl || player;
@@ -708,18 +742,7 @@
     console.warn(payload?.message || "Socket error");
   });
 
-  positionHeartbeat = setInterval(() => {
-    const el = mediaEl;
-    if (!el || el.hidden) return;
-    socket.emit("sync_position", {
-      code,
-      position: el.currentTime || 0,
-      playing: !el.paused && !el.ended,
-    });
-  }, 4000);
-
   window.addEventListener("beforeunload", () => {
-    if (positionHeartbeat) clearInterval(positionHeartbeat);
     Object.values(pollTimers).forEach(clearInterval);
   });
 

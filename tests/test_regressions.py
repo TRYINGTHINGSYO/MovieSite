@@ -7,72 +7,58 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.exc import IntegrityError
 from wtforms.validators import ValidationError
 
-from models import RoomMembership, RoomVideo, User, WatchRoom, db
+from models import (
+    MediaAsset,
+    MediaCleanupJob,
+    MediaSource,
+    MuxMediaSource,
+    QueueEntry,
+    RoomMedia,
+    RoomMembership,
+    User,
+    WatchRoom,
+    db,
+)
 from movie_theater import limiter, lock_room, socketio
 
-from test_rooms import create_room
+from test_rooms import add_ready_media, create_room
 
 
-def add_videos(app, code, count=3):
-    with app.app_context():
-        room = db.session.scalar(select(WatchRoom).where(WatchRoom.code == code))
-        user = db.session.scalar(select(User).where(User.id == room.owner_id))
-        videos = [
-            RoomVideo(
-                id=f"video-{index}",
-                name=f"Video {index}",
-                sort_order=index,
-                status="ready",
-                asset_id=f"asset-{index}",
-                playback_id=f"playback-{index}",
-                url=f"https://stream.example/{index}.m3u8",
-                created_by=user,
-            )
-            for index in range(count)
-        ]
-        room.videos.extend(videos)
-        room.current_video = videos[0]
-        db.session.commit()
-
-
-def test_multi_video_completion_commits_before_mux_delete(app, client, register):
+def test_multi_video_completion_preserves_saved_mux_media(app, client, register):
     register()
     code = create_room(client)
-    add_videos(app, code)
-    observed = []
-    transaction_committed = False
-
-    @event.listens_for(db.session.session_factory, "after_commit")
-    def mark_committed(_session):
-        nonlocal transaction_committed
-        transaction_committed = True
-
-    def assert_committed(asset_id):
-        observed.append((asset_id, transaction_committed))
+    add_ready_media(app, code, count=3)
 
     socket_client = socketio.test_client(app, flask_test_client=client)
     socket_client.emit("join", {"code": code})
-    transaction_committed = False
-    with patch("movie_theater.delete_mux_asset", side_effect=assert_committed):
+    with patch("movie_theater.delete_mux_asset") as delete_asset:
         socket_client.emit(
-            "video_ended", {"code": code, "index": 0, "video_id": "video-0"}
+            "video_ended",
+            {
+                "code": code,
+                "video_id": "video-0",
+                "expected_playback_version": 1,
+            },
         )
 
-    event.remove(db.session.session_factory, "after_commit", mark_committed)
-    assert observed == [("asset-0", True)]
+    delete_asset.assert_not_called()
     with app.app_context():
         room = db.session.scalar(select(WatchRoom).where(WatchRoom.code == code))
-        assert [(video.id, video.sort_order) for video in room.videos] == [
+        assert [(entry.id, entry.position) for entry in room.queue_entries] == [
             ("video-1", 1),
             ("video-2", 2),
         ]
+        assert db.session.scalar(select(MediaAsset).where(MediaAsset.id == "media-0"))
+        assert db.session.scalar(
+            select(MuxMediaSource).where(MuxMediaSource.asset_id == "asset-0")
+        )
     socket_client.disconnect()
 
 
 def test_failed_completion_does_not_delete_mux_asset(app, client, register):
     register()
     code = create_room(client)
-    add_videos(app, code, count=1)
+    add_ready_media(app, code, count=1)
     socket_client = socketio.test_client(app, flask_test_client=client)
     socket_client.emit("join", {"code": code})
 
@@ -82,7 +68,12 @@ def test_failed_completion_does_not_delete_mux_asset(app, client, register):
         pytest.raises(IntegrityError),
     ):
         socket_client.emit(
-            "video_ended", {"code": code, "index": 0, "video_id": "video-0"}
+            "video_ended",
+            {
+                "code": code,
+                "video_id": "video-0",
+                "expected_playback_version": 1,
+            },
         )
     delete_asset.assert_not_called()
     with app.app_context():
@@ -124,7 +115,7 @@ def test_upload_room_query_compiles_to_postgres_for_update():
     assert "FOR UPDATE" in compiled
 
 
-def test_locked_room_refreshes_stale_current_video(app):
+def test_locked_room_refreshes_stale_current_queue_entry(app):
     with app.app_context():
         owner = User(email="owner@example.com")
         owner.set_password("correct-horse")
@@ -133,23 +124,30 @@ def test_locked_room_refreshes_stale_current_video(app):
         db.session.add(room)
         db.session.commit()
         stale = db.session.get(WatchRoom, room.id)
-        video = RoomVideo(
-            id="first-video",
-            room_id=room.id,
-            name="Video",
-            sort_order=0,
-            status="ready",
-            created_by=owner,
+        asset = MediaAsset(id="media", title="Video", created_by=owner)
+        source = MediaSource(
+            id="source", asset=asset, source_type="mux_upload", status="ready"
         )
-        db.session.add(video)
+        mux = MuxMediaSource(source=source, playback_id="playback")
+        room_media = RoomMedia(
+            id="saved", room=room, asset=asset, added_by=owner
+        )
+        entry = QueueEntry(
+            id="first-entry",
+            room=room,
+            room_media=room_media,
+            position=0,
+            added_by=owner,
+        )
+        db.session.add_all([asset, source, mux, room_media, entry])
         db.session.flush()
         db.session.execute(
             WatchRoom.__table__.update()
             .where(WatchRoom.id == room.id)
-            .values(current_video_id=video.id)
+            .values(current_queue_entry_id=entry.id)
         )
-        assert stale.current_video_id is None
-        assert lock_room(room.id).current_video_id == video.id
+        assert stale.current_queue_entry_id is None
+        assert lock_room(room.id).current_queue_entry_id == entry.id
 
 
 def test_upload_order_query_locks_room_row(app, client, register):
@@ -186,10 +184,10 @@ def test_upload_uses_database_max_order_and_cleans_mux_on_commit_failure(
 ):
     register()
     code = create_room(client)
-    add_videos(app, code, count=2)
+    add_ready_media(app, code, count=2)
     with app.app_context():
         room = db.session.scalar(select(WatchRoom).where(WatchRoom.code == code))
-        db.session.delete(room.videos[0])
+        db.session.delete(room.queue_entries[0])
         db.session.commit()
 
     mux_response = Mock(ok=True)
@@ -206,23 +204,36 @@ def test_upload_uses_database_max_order_and_cleans_mux_on_commit_failure(
     assert response.status_code == 200
     with app.app_context():
         room = db.session.scalar(select(WatchRoom).where(WatchRoom.code == code))
-        assert [video.sort_order for video in room.videos] == [1, 2]
+        assert [entry.position for entry in room.queue_entries] == [1, 2]
 
     failed_response = Mock(ok=True)
     failed_response.json.return_value = {
         "data": {"url": "https://upload.example", "id": "upload-failed"}
     }
+    real_commit = db.session.commit
+    commit_calls = 0
+
+    def fail_link_commit():
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 2:
+            raise IntegrityError("x", {}, None)
+        return real_commit()
+
     with (
         patch("movie_theater.mux_configured", return_value=True),
         patch("movie_theater.requests.post", return_value=failed_response),
-        patch("movie_theater.db.session.commit", side_effect=IntegrityError("x", {}, None)),
-        patch("movie_theater.delete_mux_upload") as cleanup,
+        patch("movie_theater.db.session.commit", side_effect=fail_link_commit),
         pytest.raises(IntegrityError),
     ):
         client.post(f"/api/mux/create-upload/{code}", json={"filename": "fail.mp4"})
-    cleanup.assert_called_once_with("upload-failed")
     with app.app_context():
         db.session.rollback()
+        cleanup_job = db.session.scalar(
+            select(MediaCleanupJob).where(MediaCleanupJob.remote_id == "upload-failed")
+        )
+        assert cleanup_job is not None
+        assert cleanup_job.status == "pending"
 
 
 def test_socketio_rejects_cross_origin_handshake(app, client):
@@ -254,7 +265,7 @@ def test_csrf_token_does_not_expire_for_long_lived_room(app, client):
         validate_csrf(token, time_limit=None)
 
 
-def test_user_deletion_policy_preserves_other_rooms_and_videos(app):
+def test_user_deletion_policy_preserves_other_rooms_and_media(app):
     with app.app_context():
         owner = User(email="owner@example.com")
         owner.set_password("correct-horse")
@@ -264,22 +275,27 @@ def test_user_deletion_policy_preserves_other_rooms_and_videos(app):
         room.memberships.extend(
             [RoomMembership(user=owner), RoomMembership(user=uploader)]
         )
-        room.videos.append(
-            RoomVideo(
-                id="video",
-                name="Video",
-                sort_order=0,
-                status="ready",
-                created_by=uploader,
-            )
+        asset = MediaAsset(id="media", title="Video", created_by=uploader)
+        source = MediaSource(
+            id="source", asset=asset, source_type="mux_upload", status="ready"
         )
-        db.session.add(room)
+        room_media = RoomMedia(
+            id="saved", room=room, asset=asset, added_by=uploader
+        )
+        queue_entry = QueueEntry(
+            id="entry",
+            room=room,
+            room_media=room_media,
+            position=0,
+            added_by=uploader,
+        )
+        db.session.add_all([room, asset, source, room_media, queue_entry])
         db.session.commit()
 
         db.session.delete(uploader)
         db.session.commit()
         db.session.expire_all()
-        assert db.session.scalar(select(RoomVideo)).created_by_id is None
+        assert db.session.scalar(select(MediaAsset)).created_by_id is None
         assert db.session.scalar(select(WatchRoom)).id == room.id
 
         with pytest.raises(IntegrityError):

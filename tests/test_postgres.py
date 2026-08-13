@@ -47,9 +47,22 @@ def test_postgres_migration_and_row_locking():
                 ),
                 {"schema": schema},
             ).scalars().all()
-            assert {"users", "watch_rooms", "room_videos", "room_memberships"} <= set(
-                tables
-            )
+            assert {
+                "users",
+                "watch_rooms",
+                "room_videos",
+                "room_memberships",
+                "media_assets",
+                "media_sources",
+                "mux_media_sources",
+                "direct_url_sources",
+                "browser_local_sources",
+                "room_media",
+                "queue_entries",
+                "room_member_permissions",
+                "room_requests",
+                "media_cleanup_jobs",
+            } <= set(tables)
             connection.execute(
                 text(
                     "INSERT INTO users (email, password_hash) "

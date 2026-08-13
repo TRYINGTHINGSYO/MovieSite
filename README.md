@@ -17,6 +17,8 @@ Synced watch-party rooms. Uploads go to **Mux** (transcoded HLS) so everyone get
 
 Do **not** use the Mux Data “environment key” (from the player/analytics setup screen). That is not an API access token.
 
+The Stage 2A expand/backfill migration should be deployed during a brief maintenance window so the previous process cannot create Stage 1 queue rows during the backfill. It retains the Stage 1 `room_videos` table for immediate validation rollback. The downgrade refuses to run after Stage 2-only media, queue, permission, request, or provider-state changes would make rollback lossy; use the pre-deployment database snapshot in that case. A later contract migration will remove the legacy table after validation.
+
 ## Local run
 
 ```bash
@@ -40,5 +42,6 @@ Run tests with `pytest`. Set `TEST_POSTGRES_URL` to include the PostgreSQL integ
 - Drop a video → host plays immediately from the original file
 - File uploads directly to Mux (not through Railway body limits)
 - When Mux is ready, the whole room switches to the shared HLS URL (synced via Socket.IO)
-- Host can **Download original**
-- Finished videos are removed from the queue and deleted from Mux
+- The backend stores reusable media separately from stable-ID queue entries
+- Room owners are implicitly fully privileged; other members are viewers until granted permissions
+- Finishing a video removes only its queue entry; the saved media and Mux asset remain

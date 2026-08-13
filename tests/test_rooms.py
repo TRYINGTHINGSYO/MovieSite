@@ -1,12 +1,70 @@
 from sqlalchemy import select
 
-from models import RoomMembership, User, WatchRoom, db
+from models import (
+    MediaAsset,
+    MediaSource,
+    MuxMediaSource,
+    QueueEntry,
+    RoomMedia,
+    RoomMembership,
+    User,
+    WatchRoom,
+    db,
+)
 
 
 def create_room(client, name="Friday Films"):
     response = client.post("/create", data={"name": name})
     assert response.status_code == 302
     return response.headers["Location"].rsplit("/", 1)[-1]
+
+
+def add_ready_media(app, code, count=1):
+    entry_ids = []
+    with app.app_context():
+        room = db.session.scalar(select(WatchRoom).where(WatchRoom.code == code))
+        user = db.session.get(User, room.owner_id)
+        for index in range(count):
+            asset = MediaAsset(
+                id=f"media-{index}",
+                title=f"Video {index}",
+                duration=120 + index,
+                created_by=user,
+            )
+            source = MediaSource(
+                id=f"source-{index}",
+                asset=asset,
+                source_type="mux_upload",
+                status="ready",
+            )
+            mux = MuxMediaSource(
+                source=source,
+                upload_id=f"upload-{index}",
+                asset_id=f"asset-{index}",
+                playback_id=f"playback-{index}",
+            )
+            room_media = RoomMedia(
+                id=f"saved-{index}",
+                room=room,
+                asset=asset,
+                added_by=user,
+            )
+            entry = QueueEntry(
+                id=f"video-{index}",
+                room=room,
+                room_media=room_media,
+                position=index,
+                added_by=user,
+            )
+            db.session.add_all([asset, source, mux, room_media, entry])
+            entry_ids.append(entry.id)
+        db.session.flush()
+        if entry_ids and room.current_queue_entry_id is None:
+            room.current_queue_entry_id = entry_ids[0]
+            room.queue_version += count
+            room.playback_version += 1
+        db.session.commit()
+    return entry_ids
 
 
 def test_database_starts_empty_for_each_test(app):

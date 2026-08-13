@@ -6,7 +6,6 @@ import os
 import re
 import secrets
 import string
-import uuid
 from datetime import UTC, datetime
 from urllib.parse import urljoin, urlparse
 
@@ -24,12 +23,43 @@ from flask_login import (
 from flask_migrate import Migrate
 from flask_socketio import SocketIO, disconnect, emit, join_room, leave_room
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
-from models import RoomMembership, RoomVideo, User, WatchRoom, db
+from authorization import (
+    AuthorizationError,
+    Permission,
+    RoomUnavailableError,
+    actor_for_user,
+    can_view_room,
+    lock_room_for,
+    require_permission,
+)
+from media_sources import queue_entry_to_public, room_media_to_public
+from models import (
+    MediaSource,
+    MuxMediaSource,
+    QueueEntry,
+    RoomMembership,
+    User,
+    WatchRoom,
+    db,
+)
+from room_commands import (
+    CommandError,
+    ResourceNotFoundError,
+    VersionConflictError,
+    complete_current_queue_entry,
+    create_mux_media,
+    mux_source_for_entry,
+    queue_entries_for,
+    queue_entry_for,
+    schedule_mux_cleanup,
+    select_queue_entry,
+    update_playback,
+)
 
 app = Flask(__name__)
 on_railway = bool(
@@ -157,39 +187,56 @@ def lock_room(room_id: int) -> WatchRoom | None:
 
 
 def user_can_access(room: WatchRoom | None) -> bool:
-    return bool(
-        room
-        and current_user.is_authenticated
-        and db.session.get(RoomMembership, (room.id, current_user.id))
-    )
+    return can_view_room(room, actor_for_user(current_user))
 
 
 def current_index(room: WatchRoom) -> int | None:
-    if room.current_video_id is None:
+    if room.current_queue_entry_id is None:
         return None
+    entries = queue_entries_for(room.id)
     return next(
-        (index for index, video in enumerate(room.videos) if video.id == room.current_video_id),
+        (
+            index
+            for index, entry in enumerate(entries)
+            if entry.id == room.current_queue_entry_id
+        ),
         None,
     )
 
 
 def public_state(room: WatchRoom) -> dict:
+    entries = queue_entries_for(room.id)
     return {
-        "queue": [video.to_public() for video in room.videos],
+        "queue": [queue_entry_to_public(entry) for entry in entries],
+        "library": [
+            room_media_to_public(room_media)
+            for room_media in room.library_items
+            if room_media.asset.deleted_at is None
+        ],
         "current": current_index(room),
+        "current_id": room.current_queue_entry_id,
         "playing": room.playing,
-        "position": room.position,
+        "position": effective_position(room),
+        "queue_version": room.queue_version,
+        "playback_version": room.playback_version,
         "viewer_count": viewer_counts.get(room.code, 0),
         "mux": mux_configured(),
     }
 
 
-def find_queue_item(room: WatchRoom, video_id: str) -> RoomVideo | None:
-    return next((video for video in room.videos if video.id == video_id), None)
+def effective_position(room: WatchRoom) -> float:
+    position = max(0.0, float(room.position or 0.0))
+    if not room.playing or room.playback_updated_at is None:
+        return position
+    updated_at = room.playback_updated_at
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    elapsed = max(0.0, (datetime.now(UTC) - updated_at).total_seconds())
+    return position + elapsed
 
 
-def hls_url(playback_id: str) -> str:
-    return f"https://stream.mux.com/{playback_id}.m3u8"
+def find_queue_item(room: WatchRoom, video_id: str) -> QueueEntry | None:
+    return queue_entry_for(room.id, video_id)
 
 
 def delete_mux_asset(asset_id: str | None) -> None:
@@ -205,17 +252,21 @@ def delete_mux_asset(asset_id: str | None) -> None:
         pass
 
 
-def refresh_mux_item(item: RoomVideo) -> RoomVideo:
-    """Poll Mux upload/asset and update a queue item in place."""
+def refresh_mux_item(item: QueueEntry) -> QueueEntry:
+    """Poll Mux and update the reusable media source behind a queue entry."""
     if not mux_configured():
         return item
-    if item.status == "ready" and item.playback_id and item.url:
+    source_pair = mux_source_for_entry(item)
+    if source_pair is None:
+        return item
+    source, mux = source_pair
+    if source.status == "ready" and mux.playback_id:
         return item
 
     try:
-        if item.mux_upload_id and not item.asset_id:
+        if mux.upload_id and not mux.asset_id:
             resp = requests.get(
-                f"{MUX_API}/uploads/{item.mux_upload_id}",
+                f"{MUX_API}/uploads/{mux.upload_id}",
                 auth=mux_auth(),
                 timeout=30,
             )
@@ -223,16 +274,16 @@ def refresh_mux_item(item: RoomVideo) -> RoomVideo:
                 data = resp.json().get("data") or {}
                 status = data.get("status")
                 if status == "asset_created" and data.get("asset_id"):
-                    item.asset_id = data["asset_id"]
-                    item.status = "processing"
+                    mux.asset_id = data["asset_id"]
+                    source.status = "processing"
                 elif status in ("errored", "cancelled", "timed_out"):
-                    item.status = "error"
-                    item.error = f"Upload {status}"
+                    source.status = "error"
+                    source.error = f"Upload {status}"
                     return item
 
-        if item.asset_id:
+        if mux.asset_id:
             resp = requests.get(
-                f"{MUX_API}/assets/{item.asset_id}",
+                f"{MUX_API}/assets/{mux.asset_id}",
                 auth=mux_auth(),
                 timeout=30,
             )
@@ -251,36 +302,26 @@ def refresh_mux_item(item: RoomVideo) -> RoomVideo:
                     )
                     playback_id = (public or {}).get("id")
                     if playback_id:
-                        item.playback_id = playback_id
-                        item.url = hls_url(playback_id)
-                        item.status = "ready"
-                        item.duration = data.get("duration")
+                        mux.playback_id = playback_id
+                        source.status = "ready"
+                        item.room_media.asset.duration = data.get("duration")
                     else:
-                        item.status = "processing"
+                        source.status = "processing"
                 elif asset_status == "errored":
-                    item.status = "error"
+                    source.status = "error"
                     errors = data.get("errors") or {}
                     messages = errors.get("messages") if isinstance(errors, dict) else None
-                    item.error = (
+                    source.error = (
                         messages[0]
                         if isinstance(messages, list) and messages
                         else "Mux processing failed"
                     )
                 else:
-                    item.status = "processing"
+                    source.status = "processing"
     except requests.RequestException as exc:
-        item.error = str(exc)
+        source.error = str(exc)
 
     return item
-
-
-def remove_watched_item(room: WatchRoom, index: int) -> str | None:
-    if index < 0 or index >= len(room.videos):
-        return None
-    finished = room.videos[index]
-    asset_id = finished.asset_id
-    db.session.delete(finished)
-    return asset_id
 
 
 def delete_mux_upload(upload_id: str | None) -> None:
@@ -477,8 +518,10 @@ def create_mux_upload(code: str):
     room = room_for_code(code)
     if not room:
         return {"error": "Room not found"}, 404
-    if not user_can_access(room):
-        return {"error": "Forbidden"}, 403
+    try:
+        require_permission(room, actor_for_user(current_user), Permission.ADD_MEDIA)
+    except AuthorizationError as exc:
+        return {"error": str(exc)}, 403
     if not mux_configured():
         return {
             "error": (
@@ -489,8 +532,31 @@ def create_mux_upload(code: str):
 
     body = request.get_json(silent=True) or {}
     original = secure_filename(body.get("filename") or "video") or "video"
-    video_id = uuid.uuid4().hex[:12]
+    try:
+        byte_size = int(body.get("size")) if body.get("size") is not None else None
+    except (TypeError, ValueError):
+        return {"error": "Invalid file size"}, 400
+    if byte_size is not None and byte_size < 0:
+        return {"error": "Invalid file size"}, 400
     cors_origin = os.environ.get("MUX_CORS_ORIGIN", "*").strip() or "*"
+
+    try:
+        room, item, source, _mux = create_mux_media(
+            room.id,
+            actor_for_user(current_user),
+            original,
+            byte_size=byte_size,
+        )
+        db.session.commit()
+    except AuthorizationError as exc:
+        db.session.rollback()
+        return {"error": str(exc)}, 403
+    except RoomUnavailableError:
+        db.session.rollback()
+        return {"error": "Room not found"}, 404
+    except Exception:
+        db.session.rollback()
+        raise
 
     try:
         resp = requests.post(
@@ -503,54 +569,62 @@ def create_mux_upload(code: str):
                 "new_asset_settings": {
                     "playback_policies": ["public"],
                     "video_quality": "basic",
-                    "passthrough": f"{room.code}:{video_id}",
+                    "passthrough": f"{room.code}:{source.id}",
                 },
             },
             timeout=30,
         )
     except requests.RequestException as exc:
+        source = db.session.get(MediaSource, source.id)
+        source.status = "error"
+        source.error = f"Mux request failed: {exc}"
+        db.session.commit()
+        socketio.emit("queue_updated", public_state(room), room=room.code)
         return {"error": f"Mux request failed: {exc}"}, 502
 
     if not resp.ok:
-        return {"error": mux_error_message(resp), "status": resp.status_code}, 502
+        source = db.session.get(MediaSource, source.id)
+        source.status = "error"
+        error_message = mux_error_message(resp)
+        source.error = error_message
+        db.session.commit()
+        socketio.emit("queue_updated", public_state(room), room=room.code)
+        return {"error": error_message, "status": resp.status_code}, 502
 
     data = (resp.json() or {}).get("data") or {}
     upload_url = data.get("url")
     mux_upload_id = data.get("id")
     if not upload_url or not mux_upload_id:
+        source = db.session.get(MediaSource, source.id)
+        source.status = "error"
+        source.error = "Mux did not return an upload URL"
+        db.session.commit()
+        socketio.emit("queue_updated", public_state(room), room=room.code)
         return {"error": "Mux did not return an upload URL"}, 502
 
     try:
-        room = lock_room(room.id)
-        next_order = db.session.scalar(
-            select(func.coalesce(func.max(RoomVideo.sort_order), -1)).where(
-                RoomVideo.room_id == room.id
-            )
-        ) + 1
-        item = RoomVideo(
-            id=video_id,
-            room_id=room.id,
-            name=original,
-            sort_order=next_order,
-            status="uploading",
-            mux_upload_id=mux_upload_id,
-            created_by_id=current_user.id,
-        )
-        db.session.add(item)
-        if room.current_video_id is None:
-            room.current_video = item
-            room.playing = True
-            room.position = 0.0
+        source = db.session.get(MediaSource, source.id)
+        mux = db.session.get(MuxMediaSource, source.id)
+        mux.upload_id = mux_upload_id
+        source.status = "uploading"
         db.session.commit()
     except Exception:
         db.session.rollback()
-        delete_mux_upload(mux_upload_id)
+        try:
+            source = db.session.get(MediaSource, source.id)
+            source.status = "error"
+            source.error = "Mux upload was created but could not be linked"
+            schedule_mux_cleanup(source.id, mux_upload_id)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
         raise
 
+    room = db.session.get(WatchRoom, room.id)
     socketio.emit("queue_updated", public_state(room), room=room.code)
     return {
         "ok": True,
-        "video_id": video_id,
+        "video_id": item.id,
         "upload_url": upload_url,
         "state": public_state(room),
     }
@@ -562,17 +636,30 @@ def mux_upload_finished(code: str, video_id: str):
     room = room_for_code(code)
     if not room:
         return {"error": "Room not found"}, 404
-    if not user_can_access(room):
-        return {"error": "Forbidden"}, 403
+    try:
+        room = lock_room_for(
+            room.id, actor_for_user(current_user), Permission.ADD_MEDIA
+        )
+    except AuthorizationError as exc:
+        db.session.rollback()
+        return {"error": str(exc)}, 403
     item = find_queue_item(room, video_id)
     if not item:
         return {"error": "Video not found"}, 404
 
-    item.status = "processing"
+    source_pair = mux_source_for_entry(item)
+    if source_pair is None:
+        return {"error": "Mux source not found"}, 404
+    source, _mux = source_pair
+    source.status = "processing"
     refresh_mux_item(item)
     db.session.commit()
     socketio.emit("queue_updated", public_state(room), room=room.code)
-    return {"ok": True, "item": item.to_public(), "state": public_state(room)}
+    return {
+        "ok": True,
+        "item": queue_entry_to_public(item),
+        "state": public_state(room),
+    }
 
 
 @app.route("/api/mux/status/<code>/<video_id>", methods=["GET"])
@@ -587,12 +674,20 @@ def mux_status(code: str, video_id: str):
     if not item:
         return {"error": "Video not found"}, 404
 
-    before = item.status
+    source_pair = mux_source_for_entry(item)
+    if source_pair is None:
+        return {"error": "Mux source not found"}, 404
+    source, _mux = source_pair
+    before = source.status
     refresh_mux_item(item)
     db.session.commit()
-    if item.status != before:
+    if source.status != before:
         socketio.emit("queue_updated", public_state(room), room=room.code)
-    return {"ok": True, "item": item.to_public(), "state": public_state(room)}
+    return {
+        "ok": True,
+        "item": queue_entry_to_public(item),
+        "state": public_state(room),
+    }
 
 
 @app.route("/api/config", methods=["GET"])
@@ -668,8 +763,9 @@ def on_join(data):
     user_to_sids.setdefault(current_user.id, set()).add(request.sid)
     viewer_counts[room.code] = viewer_counts.get(room.code, 0) + 1
 
-    for item in room.videos:
-        if item.status in ("uploading", "processing"):
+    for item in queue_entries_for(room.id):
+        source_pair = mux_source_for_entry(item)
+        if source_pair and source_pair[0].status in ("uploading", "processing"):
             refresh_mux_item(item)
     db.session.commit()
 
@@ -703,110 +799,165 @@ def on_disconnect():
 
 @socketio.on("play")
 def on_play(data):
-    room = authorized_socket_room(data)
-    if not room:
+    viewed_room = authorized_socket_room(data)
+    if not viewed_room:
         return
-    position = float(data.get("position", 0))
-    room.playing = True
-    room.position = position
-    room.playback_updated_at = datetime.now(UTC)
-    db.session.commit()
-    emit("play", {"position": position}, room=room.code, include_self=False)
+    try:
+        room = update_playback(
+            viewed_room.id,
+            actor_for_user(current_user),
+            "play",
+            data.get("position", 0),
+            expected_playback_version=_expected_playback_version(data),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        _emit_socket_command_error(exc)
+        return
+    emit(
+        "play",
+        {"position": room.position, "playback_version": room.playback_version},
+        room=room.code,
+    )
 
 
 @socketio.on("pause")
 def on_pause(data):
-    room = authorized_socket_room(data)
-    if not room:
+    viewed_room = authorized_socket_room(data)
+    if not viewed_room:
         return
-    position = float(data.get("position", 0))
-    room.playing = False
-    room.position = position
-    room.playback_updated_at = datetime.now(UTC)
-    db.session.commit()
-    emit("pause", {"position": position}, room=room.code, include_self=False)
+    try:
+        room = update_playback(
+            viewed_room.id,
+            actor_for_user(current_user),
+            "pause",
+            data.get("position", 0),
+            expected_playback_version=_expected_playback_version(data),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        _emit_socket_command_error(exc)
+        return
+    emit(
+        "pause",
+        {"position": room.position, "playback_version": room.playback_version},
+        room=room.code,
+    )
 
 
 @socketio.on("seek")
 def on_seek(data):
-    room = authorized_socket_room(data)
-    if not room:
+    viewed_room = authorized_socket_room(data)
+    if not viewed_room:
         return
-    position = float(data.get("position", 0))
-    room.position = position
-    room.playback_updated_at = datetime.now(UTC)
-    db.session.commit()
+    try:
+        room = update_playback(
+            viewed_room.id,
+            actor_for_user(current_user),
+            "seek",
+            data.get("position", 0),
+            expected_playback_version=_expected_playback_version(data),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        _emit_socket_command_error(exc)
+        return
     emit(
         "seek",
-        {"position": position, "playing": room.playing},
+        {
+            "position": room.position,
+            "playing": room.playing,
+            "playback_version": room.playback_version,
+        },
         room=room.code,
-        include_self=False,
     )
 
 
 @socketio.on("select_video")
 def on_select_video(data):
-    room = authorized_socket_room(data)
-    if not room:
+    viewed_room = authorized_socket_room(data)
+    if not viewed_room:
+        return
+    entry_id = data.get("queue_entry_id") or data.get("video_id")
+    if not entry_id:
+        emit("error", {"message": "A stable queue entry ID is required"})
         return
     try:
-        index = int(data.get("index"))
-    except (TypeError, ValueError):
+        room = select_queue_entry(
+            viewed_room.id,
+            actor_for_user(current_user),
+            str(entry_id),
+            expected_playback_version=_expected_playback_version(data),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        _emit_socket_command_error(exc)
         return
-    if index < 0 or index >= len(room.videos):
-        return
-
-    room.current_video = room.videos[index]
-    room.playing = False
-    room.position = 0.0
-    room.playback_updated_at = datetime.now(UTC)
-    db.session.commit()
     emit("video_selected", public_state(room), room=room.code)
 
 
 @socketio.on("video_ended")
 def on_video_ended(data):
-    authorized = authorized_socket_room(data)
-    if not authorized:
+    viewed_room = authorized_socket_room(data)
+    if not viewed_room:
         return
-    room = lock_room(authorized.id)
-    index = current_index(room)
-    if index is None:
-        return
-    ended_video_id = data.get("video_id")
-    if ended_video_id != room.current_video_id:
+    entry_id = data.get("queue_entry_id") or data.get("video_id")
+    if not entry_id:
+        emit("error", {"message": "A stable queue entry ID is required"})
         return
     try:
-        ended_index = int(data.get("index", index))
-    except (TypeError, ValueError):
-        ended_index = index
-    if ended_index != index:
+        room = complete_current_queue_entry(
+            viewed_room.id,
+            actor_for_user(current_user),
+            str(entry_id),
+            expected_playback_version=_expected_playback_version(data),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        _emit_socket_command_error(exc)
         return
-
-    remaining = [video for i, video in enumerate(room.videos) if i != ended_index]
-    if remaining:
-        room.current_video = remaining[min(ended_index, len(remaining) - 1)]
-        room.playing = True
-    else:
-        room.current_video = None
-        room.playing = False
-    asset_id = remove_watched_item(room, ended_index)
-    room.position = 0.0
-    room.playback_updated_at = datetime.now(UTC)
-    db.session.commit()
-    delete_mux_asset(asset_id)
     emit("video_selected", public_state(room), room=room.code)
 
 
 @socketio.on("sync_position")
 def on_sync_position(data):
-    room = authorized_socket_room(data)
-    if not room:
+    viewed_room = authorized_socket_room(data)
+    if not viewed_room:
         return
-    room.position = float(data.get("position", 0))
-    room.playing = bool(data.get("playing", False))
-    room.playback_updated_at = datetime.now(UTC)
-    db.session.commit()
+    try:
+        update_playback(
+            viewed_room.id,
+            actor_for_user(current_user),
+            "sync",
+            data.get("position", 0),
+            expected_playback_version=_expected_playback_version(data),
+            playing=bool(data.get("playing", False)),
+        )
+        db.session.commit()
+    except AuthorizationError:
+        db.session.rollback()
+    except (RoomUnavailableError, CommandError) as exc:
+        _emit_socket_command_error(exc)
+
+
+def _emit_socket_command_error(exc: Exception) -> None:
+    db.session.rollback()
+    code = "conflict" if isinstance(exc, VersionConflictError) else "forbidden"
+    if isinstance(exc, (CommandError, ResourceNotFoundError)) and not isinstance(
+        exc, VersionConflictError
+    ):
+        code = "invalid_command"
+    emit("error", {"message": str(exc), "code": code})
+
+
+def _expected_playback_version(data) -> int:
+    value = data.get("expected_playback_version")
+    if value is None or isinstance(value, bool):
+        raise VersionConflictError("expected_playback_version is required")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise VersionConflictError("Invalid expected_playback_version") from exc
 
 
 if __name__ == "__main__":
