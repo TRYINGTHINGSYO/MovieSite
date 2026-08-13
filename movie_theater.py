@@ -6,6 +6,8 @@ import os
 import re
 import secrets
 import string
+import time
+import uuid
 from datetime import UTC, datetime
 from urllib.parse import urljoin, urlparse
 
@@ -29,33 +31,58 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 from authorization import (
+    ALL_PERMISSIONS,
+    Actor,
     AuthorizationError,
     Permission,
     RoomUnavailableError,
+    actor_for_guest,
     actor_for_user,
     can_view_room,
+    grant_permission,
     lock_room_for,
+    permissions_for,
     require_permission,
+    revoke_permission,
 )
+from direct_urls import DirectUrlError, require_playable_probe, validate_direct_url
 from media_sources import queue_entry_to_public, room_media_to_public
 from models import (
     MediaSource,
     MuxMediaSource,
     QueueEntry,
+    RoomCommandReceipt,
+    RoomMedia,
     RoomMembership,
+    RoomMemberPermission,
+    RoomRequest,
     User,
     WatchRoom,
     db,
+)
+from request_commands import (
+    RequestConflictError,
+    RequestValidationError,
+    create_room_request,
+    request_to_public,
+    resolve_room_request,
+    visible_requests,
 )
 from room_commands import (
     CommandError,
     ResourceNotFoundError,
     VersionConflictError,
+    add_saved_media_to_queue,
+    clear_upcoming_queue,
     complete_current_queue_entry,
+    create_direct_media,
     create_mux_media,
     mux_source_for_entry,
+    new_id,
     queue_entries_for,
     queue_entry_for,
+    remove_queue_entry,
+    reorder_queue,
     schedule_mux_cleanup,
     select_queue_entry,
     update_playback,
@@ -82,6 +109,9 @@ elif database_url.startswith("postgresql://"):
 app.config["SQLALCHEMY_DATABASE_URI"] = database_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["WTF_CSRF_TIME_LIMIT"] = None
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.environ.get("MAX_CONTENT_LENGTH", str(64 * 1024))
+)
 app.config["RATELIMIT_STORAGE_URI"] = os.environ.get(
     "RATELIMIT_STORAGE_URI", "memory://"
 )
@@ -92,6 +122,15 @@ app.config["SESSION_COOKIE_SECURE"] = (
     secure_cookie.lower() in ("1", "true", "yes")
     if secure_cookie is not None
     else on_railway or os.environ.get("FLASK_ENV") == "production"
+)
+direct_url_https = os.environ.get("DIRECT_URL_REQUIRE_HTTPS")
+app.config["DIRECT_URL_REQUIRE_HTTPS"] = bool(
+    on_railway
+    or os.environ.get("FLASK_ENV") == "production"
+    or (
+        direct_url_https is not None
+        and direct_url_https.lower() in ("1", "true", "yes")
+    )
 )
 
 db.init_app(app)
@@ -137,6 +176,9 @@ CODE_LEN = 8
 
 sid_to_code: dict[str, str] = {}
 sid_to_user: dict[str, int] = {}
+sid_to_guest: dict[str, str] = {}
+sid_to_presence: dict[str, dict] = {}
+identity_join_failures: dict[str, list[float]] = {}
 user_to_sids: dict[int, set[str]] = {}
 revoked_sids: set[str] = set()
 viewer_counts: dict[str, int] = {}
@@ -170,6 +212,8 @@ def generate_code() -> str:
 
 
 def room_for_code(code: str) -> WatchRoom | None:
+    if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9]{8}", code):
+        return None
     return db.session.scalar(
         select(WatchRoom).where(
             WatchRoom.code == code.upper(), WatchRoom.archived_at.is_(None)
@@ -186,8 +230,38 @@ def lock_room(room_id: int) -> WatchRoom | None:
     )
 
 
+def ensure_guest_id() -> str:
+    guest_id = session.get("guest_id")
+    try:
+        normalized = str(uuid.UUID(str(guest_id)))
+    except (TypeError, ValueError, AttributeError):
+        normalized = str(uuid.uuid4())
+        session["guest_id"] = normalized
+    return normalized
+
+
+def current_actor(*, create_guest: bool = True) -> Actor:
+    if current_user.is_authenticated:
+        return actor_for_user(current_user)
+    guest_id = ensure_guest_id() if create_guest else session.get("guest_id")
+    if not guest_id:
+        return Actor(kind="anonymous")
+    return actor_for_guest(str(guest_id))
+
+
+def actor_label(actor: Actor) -> str:
+    if actor.is_user:
+        user = db.session.get(User, actor.user_id)
+        if user is not None:
+            return (user.display_name or f"Member {user.id}")[:80]
+    if actor.is_guest:
+        token = str(actor.guest_id).replace("-", "")[:6].upper()
+        return f"Guest {token}"
+    return "Viewer"
+
+
 def user_can_access(room: WatchRoom | None) -> bool:
-    return can_view_room(room, actor_for_user(current_user))
+    return can_view_room(room, current_actor())
 
 
 def current_index(room: WatchRoom) -> int | None:
@@ -204,8 +278,11 @@ def current_index(room: WatchRoom) -> int | None:
     )
 
 
-def public_state(room: WatchRoom) -> dict:
+def public_state(room: WatchRoom, actor: Actor | None = None) -> dict:
+    actor = actor or current_actor()
     entries = queue_entries_for(room.id)
+    capabilities = permissions_for(room, actor)
+    requests_for_actor = visible_requests(room, actor)
     return {
         "queue": [queue_entry_to_public(entry) for entry in entries],
         "library": [
@@ -221,7 +298,73 @@ def public_state(room: WatchRoom) -> dict:
         "playback_version": room.playback_version,
         "viewer_count": viewer_counts.get(room.code, 0),
         "mux": mux_configured(),
+        "identity": {
+            "kind": actor.kind,
+            "key": actor.key,
+            "label": actor_label(actor),
+            "is_owner": actor.is_user and actor.user_id == room.owner_id,
+        },
+        "capabilities": sorted(permission.value for permission in capabilities),
+        "people": room_people(room, actor),
+        "presence": room_presence(room.code),
+        "requests": [request_to_public(item) for item in requests_for_actor],
     }
+
+
+def room_people(room: WatchRoom, actor: Actor) -> list[dict]:
+    result = []
+    memberships = db.session.scalars(
+        select(RoomMembership)
+        .where(RoomMembership.room_id == room.id)
+        .order_by(RoomMembership.joined_at, RoomMembership.user_id)
+    ).all()
+    can_manage = Permission.MANAGE_MEMBERS in permissions_for(room, actor)
+    for membership in memberships:
+        user = membership.user
+        member_actor = actor_for_user(user)
+        item = {
+            "user_id": user.id,
+            "label": (user.display_name or f"Member {user.id}")[:80],
+            "is_owner": user.id == room.owner_id,
+        }
+        if can_manage:
+            item["permissions"] = sorted(
+                permission.value for permission in permissions_for(room, member_actor)
+            )
+        result.append(item)
+    return result
+
+
+def room_presence(code: str) -> list[dict]:
+    by_identity: dict[str, dict] = {}
+    for sid, joined_code in sid_to_code.items():
+        if joined_code != code:
+            continue
+        presence = sid_to_presence.get(sid)
+        if presence:
+            by_identity[presence["key"]] = dict(presence)
+    return sorted(by_identity.values(), key=lambda item: (item["kind"], item["label"]))
+
+
+def actor_for_sid(sid: str) -> Actor:
+    user_id = sid_to_user.get(sid)
+    if user_id is not None:
+        return Actor(kind="user", user_id=user_id)
+    guest_id = sid_to_guest.get(sid)
+    if guest_id:
+        return actor_for_guest(guest_id)
+    return Actor(kind="anonymous")
+
+
+def emit_state_to_room(event: str, room: WatchRoom) -> None:
+    for sid, joined_code in list(sid_to_code.items()):
+        if joined_code == room.code:
+            socketio.emit(event, public_state(room, actor_for_sid(sid)), to=sid)
+
+
+def broadcast_room_updates(room: WatchRoom, *events: str) -> None:
+    for event in events:
+        emit_state_to_room(event, room)
 
 
 def effective_position(room: WatchRoom) -> float:
@@ -252,11 +395,19 @@ def delete_mux_asset(asset_id: str | None) -> None:
         pass
 
 
-def refresh_mux_item(item: QueueEntry) -> QueueEntry:
+def refresh_mux_item(item: QueueEntry | RoomMedia) -> QueueEntry | RoomMedia:
     """Poll Mux and update the reusable media source behind a queue entry."""
     if not mux_configured():
         return item
-    source_pair = mux_source_for_entry(item)
+    room_media = item.room_media if isinstance(item, QueueEntry) else item
+    source_pair = next(
+        (
+            (source, source.mux)
+            for source in room_media.asset.sources
+            if source.source_type == "mux_upload" and source.mux is not None
+        ),
+        None,
+    )
     if source_pair is None:
         return item
     source, mux = source_pair
@@ -304,7 +455,7 @@ def refresh_mux_item(item: QueueEntry) -> QueueEntry:
                     if playback_id:
                         mux.playback_id = playback_id
                         source.status = "ready"
-                        item.room_media.asset.duration = data.get("duration")
+                        room_media.asset.duration = data.get("duration")
                     else:
                         source.status = "processing"
                 elif asset_status == "errored":
@@ -349,7 +500,10 @@ def landing():
 
 def rate_limit_key() -> str:
     user_id = session.get("_user_id")
-    return f"user:{user_id}" if user_id else f"ip:{get_remote_address()}"
+    if user_id:
+        return f"user:{user_id}"
+    guest_id = session.get("guest_id")
+    return f"guest:{guest_id}" if guest_id else f"ip:{get_remote_address()}"
 
 
 def safe_next_url(target: str | None) -> bool:
@@ -460,7 +614,8 @@ def join_session():
     if not room:
         flash("No room found for that code. Check the invite and try again.")
         return redirect(url_for("saved_rooms"))
-    if not user_can_access(room):
+    membership = db.session.get(RoomMembership, (room.id, current_user.id))
+    if membership is None:
         db.session.add(RoomMembership(room_id=room.id, user_id=current_user.id))
         try:
             db.session.commit()
@@ -470,20 +625,330 @@ def join_session():
 
 
 @app.route("/session/<code>")
-@login_required
+@limiter.limit("60 per hour")
 def session_room(code: str):
     room = room_for_code(code)
     if not room:
         flash("That room has ended or never existed.")
-        return redirect(url_for("saved_rooms"))
+        return redirect(url_for("saved_rooms" if current_user.is_authenticated else "landing"))
     if not user_can_access(room):
-        return render_template("join_room.html", room=room), 403
+        return {"error": "Room not found or inactive"}, 404
+    actor = current_actor()
     return render_template(
         "room.html",
         code=room.code,
         room=room,
         mux_ready=mux_configured(),
+        actor=actor,
     )
+
+
+def expected_version(body: dict, field: str) -> int:
+    value = body.get(field)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise VersionConflictError(f"{field} is required")
+    version = value
+    if version < 0:
+        raise VersionConflictError(f"Invalid {field}")
+    return version
+
+
+def json_object_body() -> dict:
+    body = request.get_json(silent=True)
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise CommandError("JSON request body must be an object")
+    return body
+
+
+def stable_id(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise CommandError(f"A stable {label} ID is required")
+    candidate = value
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", candidate):
+        raise CommandError(f"A stable {label} ID is required")
+    return candidate
+
+
+def media_title(value: object) -> str:
+    if value is None or value == "":
+        return "Direct media"
+    if not isinstance(value, str):
+        raise CommandError("Media title must be a string")
+    title = value.strip()
+    if len(title) > 255:
+        raise CommandError("Media title is too long")
+    return title or "Direct media"
+
+
+def api_command_error(exc: Exception, room: WatchRoom | None = None):
+    db.session.rollback()
+    if isinstance(exc, VersionConflictError):
+        fresh = db.session.get(WatchRoom, room.id) if room is not None else None
+        payload = {"error": str(exc)}
+        if fresh is not None:
+            payload["state"] = public_state(fresh)
+        return payload, 409
+    if isinstance(exc, RequestConflictError):
+        return {"error": str(exc)}, 409
+    if isinstance(exc, ResourceNotFoundError):
+        return {"error": str(exc)}, 404
+    if isinstance(exc, (RequestValidationError, DirectUrlError, CommandError)):
+        return {"error": str(exc)}, 400
+    if isinstance(exc, AuthorizationError):
+        return {"error": str(exc)}, 403
+    if isinstance(exc, RoomUnavailableError):
+        return {"error": "Room not found or inactive"}, 404
+    raise exc
+
+
+@app.route("/api/rooms/<code>/state", methods=["GET"])
+@limiter.limit("120 per hour")
+def room_state_api(code: str):
+    room = room_for_code(code)
+    if not can_view_room(room, current_actor()):
+        return {"error": "Room not found or inactive"}, 404
+    return {"state": public_state(room)}
+
+
+@app.route("/api/rooms/<code>/media/direct-url", methods=["POST"])
+@limiter.limit("20 per hour", key_func=rate_limit_key)
+def create_direct_url_media(code: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        actor = current_actor()
+        require_permission(room, actor, Permission.ADD_MEDIA)
+        body = json_object_body()
+        validated = validate_direct_url(
+            body.get("url"),
+            require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+        )
+        probe_result = require_playable_probe(body.get("probe_result"))
+        room, room_media, _source, _direct = create_direct_media(
+            room.id,
+            actor,
+            media_title(body.get("title")),
+            validated,
+            probe_result=probe_result,
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, DirectUrlError, CommandError) as exc:
+        return api_command_error(exc, room)
+    room = db.session.get(WatchRoom, room.id)
+    broadcast_room_updates(room, "library:updated", "room:state")
+    return {
+        "ok": True,
+        "room_media_id": room_media.id,
+        "state": public_state(room),
+    }, 201
+
+
+@app.route("/api/rooms/<code>/queue", methods=["POST"])
+def queue_saved_media(code: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        actor = current_actor()
+        require_permission(room, actor, Permission.MANAGE_QUEUE)
+        body = json_object_body()
+        room, entry = add_saved_media_to_queue(
+            room.id,
+            actor,
+            stable_id(body.get("room_media_id"), "saved media"),
+            expected_queue_version=expected_version(body, "expected_queue_version"),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    broadcast_room_updates(room, "queue:updated", "room:state", "queue_updated")
+    return {"ok": True, "queue_entry_id": entry.id, "state": public_state(room)}, 201
+
+
+@app.route("/api/rooms/<code>/queue/<entry_id>", methods=["DELETE"])
+def delete_queue_entry(code: str, entry_id: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        actor = current_actor()
+        require_permission(room, actor, Permission.MANAGE_QUEUE)
+        body = json_object_body()
+        room = remove_queue_entry(
+            room.id,
+            actor,
+            stable_id(entry_id, "queue entry"),
+            expected_queue_version=expected_version(body, "expected_queue_version"),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    broadcast_room_updates(
+        room,
+        "queue:updated",
+        "playback:updated",
+        "room:state",
+        "video_selected",
+    )
+    return {"ok": True, "state": public_state(room)}
+
+
+@app.route("/api/rooms/<code>/queue/order", methods=["PUT"])
+def update_queue_order(code: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        actor = current_actor()
+        require_permission(room, actor, Permission.MANAGE_QUEUE)
+        body = json_object_body()
+        ordered_ids = body.get("queue_entry_ids")
+        if not isinstance(ordered_ids, list):
+            raise CommandError("queue_entry_ids must be a list of stable IDs")
+        ordered_ids = [stable_id(item, "queue entry") for item in ordered_ids]
+        room = reorder_queue(
+            room.id,
+            actor,
+            ordered_ids,
+            expected_queue_version=expected_version(body, "expected_queue_version"),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    broadcast_room_updates(room, "queue:updated", "room:state", "queue_updated")
+    return {"ok": True, "state": public_state(room)}
+
+
+@app.route("/api/rooms/<code>/queue/upcoming", methods=["DELETE"])
+def delete_upcoming_queue(code: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        actor = current_actor()
+        require_permission(room, actor, Permission.MANAGE_QUEUE)
+        body = json_object_body()
+        room = clear_upcoming_queue(
+            room.id,
+            actor,
+            expected_queue_version=expected_version(body, "expected_queue_version"),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    broadcast_room_updates(room, "queue:updated", "room:state", "queue_updated")
+    return {"ok": True, "state": public_state(room)}
+
+
+@app.route("/api/rooms/<code>/permissions", methods=["POST"])
+def update_member_permission(code: str):
+    viewed_room = room_for_code(code)
+    if viewed_room is None:
+        return {"error": "Room not found or inactive"}, 404
+    actor = current_actor()
+    if not actor.is_user or actor.user_id != viewed_room.owner_id:
+        return {"error": "Only the room owner can manage permissions"}, 403
+    try:
+        body = json_object_body()
+        target_user_id = body.get("user_id")
+        if isinstance(target_user_id, bool) or not isinstance(target_user_id, int):
+            raise ValueError
+        permission_value = body.get("permission")
+        if not isinstance(permission_value, str):
+            raise ValueError
+        permission = Permission(permission_value)
+        enabled = body.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError
+        if enabled:
+            grant_permission(viewed_room.id, actor, target_user_id, permission)
+        else:
+            revoke_permission(viewed_room.id, actor, target_user_id, permission)
+        db.session.commit()
+    except (TypeError, ValueError, CommandError):
+        db.session.rollback()
+        return {"error": "Invalid member or permission"}, 400
+    except (AuthorizationError, RoomUnavailableError) as exc:
+        return api_command_error(exc, viewed_room)
+    room = db.session.get(WatchRoom, viewed_room.id)
+    broadcast_room_updates(room, "permissions:updated", "room:state")
+    return {"ok": True, "state": public_state(room)}
+
+
+@app.route("/api/rooms/<code>/requests", methods=["POST"])
+@limiter.limit("30 per hour", key_func=rate_limit_key)
+def submit_room_request(code: str):
+    room = room_for_code(code)
+    actor = current_actor()
+    if not can_view_room(room, actor):
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        body = json_object_body()
+        item, created = create_room_request(
+            room.id,
+            actor,
+            actor_label(actor),
+            body.get("request_type"),
+            body.get("payload"),
+            body.get("client_request_id"),
+            require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+        )
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        try:
+            item, created = create_room_request(
+                room.id,
+                actor,
+                actor_label(actor),
+                body.get("request_type"),
+                body.get("payload"),
+                body.get("client_request_id"),
+                require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+            )
+            db.session.commit()
+        except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+            return api_command_error(exc, room)
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    room = db.session.get(WatchRoom, room.id)
+    broadcast_room_updates(room, "requests:updated", "room:state")
+    return {"ok": True, "created": created, "request": request_to_public(item)}, (201 if created else 200)
+
+
+@app.route("/api/rooms/<code>/requests/<request_id>/resolve", methods=["POST"])
+def resolve_request_api(code: str, request_id: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        body = json_object_body()
+        room, item = resolve_room_request(
+            room.id,
+            current_actor(),
+            stable_id(request_id, "request"),
+            body.get("resolution"),
+            require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+        )
+        db.session.commit()
+    except RequestConflictError as exc:
+        db.session.commit()
+        return {"error": str(exc), "state": public_state(room)}, 409
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    room = db.session.get(WatchRoom, room.id)
+    broadcast_room_updates(
+        room,
+        "requests:updated",
+        "queue:updated",
+        "library:updated",
+        "playback:updated",
+        "room:state",
+    )
+    return {"ok": True, "request": request_to_public(item), "state": public_state(room)}
 
 
 def mux_error_message(resp: requests.Response) -> str:
@@ -530,23 +995,32 @@ def create_mux_upload(code: str):
             )
         }, 503
 
-    body = request.get_json(silent=True) or {}
-    original = secure_filename(body.get("filename") or "video") or "video"
     try:
+        body = json_object_body()
+        original = (secure_filename(body.get("filename") or "video") or "video")[:255]
         byte_size = int(body.get("size")) if body.get("size") is not None else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, CommandError):
         return {"error": "Invalid file size"}, 400
     if byte_size is not None and byte_size < 0:
         return {"error": "Invalid file size"}, 400
     cors_origin = os.environ.get("MUX_CORS_ORIGIN", "*").strip() or "*"
 
     try:
+        save_only = body.get("save_only", True)
+        if not isinstance(save_only, bool):
+            raise CommandError("save_only must be a boolean")
+        if not save_only:
+            raise CommandError(
+                "Upload and queue are separate operations; save the upload first"
+            )
         room, item, source, _mux = create_mux_media(
             room.id,
             actor_for_user(current_user),
             original,
             byte_size=byte_size,
+            enqueue=False,
         )
+        room_media = source.asset.room_links[0]
         db.session.commit()
     except AuthorizationError as exc:
         db.session.rollback()
@@ -554,6 +1028,9 @@ def create_mux_upload(code: str):
     except RoomUnavailableError:
         db.session.rollback()
         return {"error": "Room not found"}, 404
+    except CommandError as exc:
+        db.session.rollback()
+        return {"error": str(exc)}, 400
     except Exception:
         db.session.rollback()
         raise
@@ -579,7 +1056,7 @@ def create_mux_upload(code: str):
         source.status = "error"
         source.error = f"Mux request failed: {exc}"
         db.session.commit()
-        socketio.emit("queue_updated", public_state(room), room=room.code)
+        broadcast_room_updates(room, "queue_updated", "queue:updated", "room:state")
         return {"error": f"Mux request failed: {exc}"}, 502
 
     if not resp.ok:
@@ -588,7 +1065,7 @@ def create_mux_upload(code: str):
         error_message = mux_error_message(resp)
         source.error = error_message
         db.session.commit()
-        socketio.emit("queue_updated", public_state(room), room=room.code)
+        broadcast_room_updates(room, "queue_updated", "queue:updated", "room:state")
         return {"error": error_message, "status": resp.status_code}, 502
 
     data = (resp.json() or {}).get("data") or {}
@@ -599,7 +1076,7 @@ def create_mux_upload(code: str):
         source.status = "error"
         source.error = "Mux did not return an upload URL"
         db.session.commit()
-        socketio.emit("queue_updated", public_state(room), room=room.code)
+        broadcast_room_updates(room, "queue_updated", "queue:updated", "room:state")
         return {"error": "Mux did not return an upload URL"}, 502
 
     try:
@@ -621,10 +1098,12 @@ def create_mux_upload(code: str):
         raise
 
     room = db.session.get(WatchRoom, room.id)
-    socketio.emit("queue_updated", public_state(room), room=room.code)
+    broadcast_room_updates(room, "queue_updated", "queue:updated", "room:state")
     return {
         "ok": True,
-        "video_id": item.id,
+        "video_id": item.id if item is not None else room_media.id,
+        "room_media_id": room_media.id,
+        "queue_entry_id": item.id if item is not None else None,
         "upload_url": upload_url,
         "state": public_state(room),
     }
@@ -644,26 +1123,39 @@ def mux_upload_finished(code: str, video_id: str):
         db.session.rollback()
         return {"error": str(exc)}, 403
     item = find_queue_item(room, video_id)
-    if not item:
+    room_media = item.room_media if item else db.session.scalar(
+        select(RoomMedia).where(RoomMedia.room_id == room.id, RoomMedia.id == video_id)
+    )
+    if room_media is None:
         return {"error": "Video not found"}, 404
 
-    source_pair = mux_source_for_entry(item)
+    source_pair = next(
+        (
+            (source, source.mux)
+            for source in room_media.asset.sources
+            if source.source_type == "mux_upload" and source.mux is not None
+        ),
+        None,
+    )
     if source_pair is None:
         return {"error": "Mux source not found"}, 404
     source, _mux = source_pair
     source.status = "processing"
-    refresh_mux_item(item)
+    refresh_mux_item(room_media)
     db.session.commit()
-    socketio.emit("queue_updated", public_state(room), room=room.code)
+    broadcast_room_updates(room, "queue_updated", "queue:updated", "room:state")
     return {
         "ok": True,
-        "item": queue_entry_to_public(item),
+        "item": (
+            queue_entry_to_public(item)
+            if item is not None
+            else room_media_to_public(room_media)
+        ),
         "state": public_state(room),
     }
 
 
 @app.route("/api/mux/status/<code>/<video_id>", methods=["GET"])
-@login_required
 def mux_status(code: str, video_id: str):
     room = room_for_code(code)
     if not room:
@@ -671,21 +1163,35 @@ def mux_status(code: str, video_id: str):
     if not user_can_access(room):
         return {"error": "Forbidden"}, 403
     item = find_queue_item(room, video_id)
-    if not item:
+    room_media = item.room_media if item else db.session.scalar(
+        select(RoomMedia).where(RoomMedia.room_id == room.id, RoomMedia.id == video_id)
+    )
+    if room_media is None:
         return {"error": "Video not found"}, 404
 
-    source_pair = mux_source_for_entry(item)
+    source_pair = next(
+        (
+            (source, source.mux)
+            for source in room_media.asset.sources
+            if source.source_type == "mux_upload" and source.mux is not None
+        ),
+        None,
+    )
     if source_pair is None:
         return {"error": "Mux source not found"}, 404
     source, _mux = source_pair
     before = source.status
-    refresh_mux_item(item)
+    refresh_mux_item(room_media)
     db.session.commit()
     if source.status != before:
-        socketio.emit("queue_updated", public_state(room), room=room.code)
+        broadcast_room_updates(room, "queue_updated", "queue:updated", "room:state")
     return {
         "ok": True,
-        "item": queue_entry_to_public(item),
+        "item": (
+            queue_entry_to_public(item)
+            if item is not None
+            else room_media_to_public(room_media)
+        ),
         "state": public_state(room),
     }
 
@@ -722,27 +1228,58 @@ def authorized_socket_room(data) -> WatchRoom | None:
     if request.sid in revoked_sids:
         disconnect()
         return None
-    socket_user_id = sid_to_user.get(request.sid)
-    current_user_id = current_user.id if current_user.is_authenticated else None
-    if socket_user_id is not None and socket_user_id != current_user_id:
+    if not isinstance(data, dict):
+        emit("error", {"message": "Invalid room command", "code": "invalid_command"})
+        return None
+    connected_actor = actor_for_sid(request.sid)
+    request_actor = current_actor()
+    if connected_actor.key != request_actor.key:
         disconnect()
         return None
     code = (data.get("code") or "").upper()
     room = room_for_code(code)
-    if not user_can_access(room):
-        emit("error", {"message": "Room not found or access denied"})
+    if not can_view_room(room, connected_actor):
+        now = time.monotonic()
+        if (
+            connected_actor.key not in identity_join_failures
+            and len(identity_join_failures) >= 10_000
+        ):
+            identity_join_failures.pop(next(iter(identity_join_failures)))
+        failures = [
+            recorded
+            for recorded in identity_join_failures.get(connected_actor.key, [])
+            if now - recorded < 600
+        ]
+        failures.append(now)
+        identity_join_failures[connected_actor.key] = failures
+        emit(
+            "error",
+            {"message": "Room not found or access denied", "code": "room_unavailable"},
+        )
+        if len(failures) >= 10:
+            disconnect()
         return None
     return room
 
 
 @socketio.on("connect")
 def on_connect():
-    if not current_user.is_authenticated:
+    actor = current_actor(create_guest=False)
+    if not (actor.is_user or actor.is_guest):
         return False
-    sid_to_user[request.sid] = current_user.id
-    user_to_sids.setdefault(current_user.id, set()).add(request.sid)
+    if actor.is_user:
+        sid_to_user[request.sid] = actor.user_id
+        user_to_sids.setdefault(actor.user_id, set()).add(request.sid)
+    else:
+        sid_to_guest[request.sid] = actor.guest_id
+    sid_to_presence[request.sid] = {
+        "key": actor.key,
+        "kind": actor.kind,
+        "label": actor_label(actor),
+    }
 
 
+@socketio.on("room:join")
 @socketio.on("join")
 def on_join(data):
     room = authorized_socket_room(data)
@@ -751,7 +1288,9 @@ def on_join(data):
 
     previous = sid_to_code.get(request.sid)
     if previous == room.code:
-        emit("state_sync", public_state(room))
+        state = public_state(room, actor_for_sid(request.sid))
+        emit("state_sync", state)
+        emit("room:state", state)
         return
     if previous:
         leave_room(previous)
@@ -759,8 +1298,6 @@ def on_join(data):
 
     join_room(room.code)
     sid_to_code[request.sid] = room.code
-    sid_to_user[request.sid] = current_user.id
-    user_to_sids.setdefault(current_user.id, set()).add(request.sid)
     viewer_counts[room.code] = viewer_counts.get(room.code, 0) + 1
 
     for item in queue_entries_for(room.id):
@@ -769,16 +1306,21 @@ def on_join(data):
             refresh_mux_item(item)
     db.session.commit()
 
-    emit("state_sync", public_state(room))
+    state = public_state(room, actor_for_sid(request.sid))
+    emit("state_sync", state)
+    emit("room:state", state)
     socketio.emit(
         "viewer_count", {"count": viewer_counts[room.code]}, room=room.code
     )
+    broadcast_room_updates(room, "presence:updated")
 
 
 @socketio.on("disconnect")
 def on_disconnect():
     revoked_sids.discard(request.sid)
     user_id = sid_to_user.pop(request.sid, None)
+    sid_to_guest.pop(request.sid, None)
+    sid_to_presence.pop(request.sid, None)
     if user_id is not None:
         sids = user_to_sids.get(user_id)
         if sids:
@@ -795,6 +1337,131 @@ def on_disconnect():
     socketio.emit(
         "viewer_count", {"count": viewer_counts.get(code, 0)}, room=code
     )
+    room = room_for_code(code)
+    if room is not None:
+        broadcast_room_updates(room, "presence:updated")
+
+
+@socketio.on("playback:command")
+def on_playback_command(data):
+    viewed_room = authorized_socket_room(data)
+    if not viewed_room:
+        return
+    actor = actor_for_sid(request.sid)
+    client_action_id = str(data.get("client_action_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", client_action_id):
+        emit(
+            "error",
+            {"message": "A valid client_action_id is required", "code": "invalid_command"},
+        )
+        return
+    action = str(data.get("action") or "").lower()
+    receipt = db.session.scalar(
+        select(RoomCommandReceipt).where(
+            RoomCommandReceipt.room_id == viewed_room.id,
+            RoomCommandReceipt.actor_key == actor.key,
+            RoomCommandReceipt.client_action_id == client_action_id,
+        )
+    )
+    if receipt is not None:
+        if receipt.command_type != action:
+            emit(
+                "error",
+                {
+                    "message": "client_action_id was already used for a different command",
+                    "code": "conflict",
+                },
+            )
+            return
+        emit("playback:updated", {**(receipt.result or {}), "duplicate": True})
+        return
+
+    try:
+        receipt = RoomCommandReceipt(
+            id=new_id(),
+            room_id=viewed_room.id,
+            actor_kind=actor.kind,
+            actor_key=actor.key,
+            client_action_id=client_action_id,
+            command_type=action[:40],
+            result={},
+        )
+        db.session.add(receipt)
+        db.session.flush()
+        expected = _expected_playback_version(data)
+        if action in {"play", "pause", "seek"}:
+            room = update_playback(
+                viewed_room.id,
+                actor,
+                action,
+                data.get("position", 0),
+                expected_playback_version=expected,
+            )
+        elif action == "select":
+            entry_id = stable_id(data.get("queue_entry_id"), "queue entry")
+            room = select_queue_entry(
+                viewed_room.id,
+                actor,
+                entry_id,
+                expected_playback_version=expected,
+            )
+        elif action == "next":
+            entry_id = viewed_room.current_queue_entry_id
+            if not entry_id:
+                raise ResourceNotFoundError("There is no current queue entry")
+            room = complete_current_queue_entry(
+                viewed_room.id,
+                actor,
+                entry_id,
+                expected_playback_version=expected,
+            )
+        else:
+            raise CommandError("Unknown playback command")
+        receipt.result = {
+            "ok": True,
+            "client_action_id": client_action_id,
+            "action": action,
+            "queue_version": room.queue_version,
+            "playback_version": room.playback_version,
+            "position": room.position,
+            "playing": room.playing,
+            "current_id": room.current_queue_entry_id,
+        }
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        receipt = db.session.scalar(
+            select(RoomCommandReceipt).where(
+                RoomCommandReceipt.room_id == viewed_room.id,
+                RoomCommandReceipt.actor_key == actor.key,
+                RoomCommandReceipt.client_action_id == client_action_id,
+            )
+        )
+        if receipt is None:
+            emit("error", {"message": "Duplicate command conflict", "code": "conflict"})
+            return
+        if receipt.command_type != action:
+            emit(
+                "error",
+                {
+                    "message": "client_action_id was already used for a different command",
+                    "code": "conflict",
+                },
+            )
+            return
+        emit("playback:updated", {**(receipt.result or {}), "duplicate": True})
+        return
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        _emit_socket_command_error(exc)
+        return
+
+    broadcast_room_updates(
+        room,
+        "playback:updated",
+        "queue:updated",
+        "room:state",
+        "video_selected",
+    )
 
 
 @socketio.on("play")
@@ -805,7 +1472,7 @@ def on_play(data):
     try:
         room = update_playback(
             viewed_room.id,
-            actor_for_user(current_user),
+            actor_for_sid(request.sid),
             "play",
             data.get("position", 0),
             expected_playback_version=_expected_playback_version(data),
@@ -819,6 +1486,7 @@ def on_play(data):
         {"position": room.position, "playback_version": room.playback_version},
         room=room.code,
     )
+    broadcast_room_updates(room, "playback:updated")
 
 
 @socketio.on("pause")
@@ -829,7 +1497,7 @@ def on_pause(data):
     try:
         room = update_playback(
             viewed_room.id,
-            actor_for_user(current_user),
+            actor_for_sid(request.sid),
             "pause",
             data.get("position", 0),
             expected_playback_version=_expected_playback_version(data),
@@ -843,6 +1511,7 @@ def on_pause(data):
         {"position": room.position, "playback_version": room.playback_version},
         room=room.code,
     )
+    broadcast_room_updates(room, "playback:updated")
 
 
 @socketio.on("seek")
@@ -853,7 +1522,7 @@ def on_seek(data):
     try:
         room = update_playback(
             viewed_room.id,
-            actor_for_user(current_user),
+            actor_for_sid(request.sid),
             "seek",
             data.get("position", 0),
             expected_playback_version=_expected_playback_version(data),
@@ -871,6 +1540,7 @@ def on_seek(data):
         },
         room=room.code,
     )
+    broadcast_room_updates(room, "playback:updated")
 
 
 @socketio.on("select_video")
@@ -885,7 +1555,7 @@ def on_select_video(data):
     try:
         room = select_queue_entry(
             viewed_room.id,
-            actor_for_user(current_user),
+            actor_for_sid(request.sid),
             str(entry_id),
             expected_playback_version=_expected_playback_version(data),
         )
@@ -893,7 +1563,7 @@ def on_select_video(data):
     except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
         _emit_socket_command_error(exc)
         return
-    emit("video_selected", public_state(room), room=room.code)
+    broadcast_room_updates(room, "video_selected", "playback:updated", "room:state")
 
 
 @socketio.on("video_ended")
@@ -908,7 +1578,7 @@ def on_video_ended(data):
     try:
         room = complete_current_queue_entry(
             viewed_room.id,
-            actor_for_user(current_user),
+            actor_for_sid(request.sid),
             str(entry_id),
             expected_playback_version=_expected_playback_version(data),
         )
@@ -916,7 +1586,9 @@ def on_video_ended(data):
     except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
         _emit_socket_command_error(exc)
         return
-    emit("video_selected", public_state(room), room=room.code)
+    broadcast_room_updates(
+        room, "video_selected", "queue:updated", "playback:updated", "room:state"
+    )
 
 
 @socketio.on("sync_position")
@@ -927,7 +1599,7 @@ def on_sync_position(data):
     try:
         update_playback(
             viewed_room.id,
-            actor_for_user(current_user),
+            actor_for_sid(request.sid),
             "sync",
             data.get("position", 0),
             expected_playback_version=_expected_playback_version(data),
@@ -952,12 +1624,11 @@ def _emit_socket_command_error(exc: Exception) -> None:
 
 def _expected_playback_version(data) -> int:
     value = data.get("expected_playback_version")
-    if value is None or isinstance(value, bool):
+    if not isinstance(value, int) or isinstance(value, bool):
         raise VersionConflictError("expected_playback_version is required")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise VersionConflictError("Invalid expected_playback_version") from exc
+    if value < 0:
+        raise VersionConflictError("Invalid expected_playback_version")
+    return value
 
 
 if __name__ == "__main__":

@@ -439,7 +439,8 @@ def test_mux_remote_creation_happens_after_durable_media_state(
         source = db.session.scalar(select(MediaSource))
         assert source is not None
         assert source.status == "creating"
-        assert db.session.scalar(select(QueueEntry)) is not None
+        assert db.session.scalar(select(RoomMedia)) is not None
+        assert db.session.scalar(select(QueueEntry)) is None
         response = Mock(ok=True)
         response.json.return_value = {
             "data": {"url": "https://upload.example", "id": "mux-upload"}

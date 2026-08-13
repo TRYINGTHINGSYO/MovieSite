@@ -13,6 +13,7 @@ Synced watch-party rooms. Uploads go to **Mux** (transcoded HLS) so everyone get
    - `SECRET_KEY` = any long random string; keep it stable across deployments
    - `SOCKETIO_ALLOWED_ORIGINS` = optional comma-separated public origins; same-origin only by default
    - `RATELIMIT_STORAGE_URI` = optional shared rate-limit backend; the single-worker default uses memory
+   - `DIRECT_URL_REQUIRE_HTTPS` = optional local override to force HTTPS; Railway requires HTTPS regardless
 5. Redeploy. Railway runs `flask --app movie_theater.py db upgrade` before starting the app. Check `https://YOUR-APP.up.railway.app/api/mux/health` — it should return `{"ok": true}`.
 
 Do **not** use the Mux Data “environment key” (from the player/analytics setup screen). That is not an API access token.
@@ -39,9 +40,14 @@ Run tests with `pytest`. Set `TEST_POSTGRES_URL` to include the PostgreSQL integ
 
 - Register or sign in to create and join persistent rooms
 - Owned and joined rooms remain on the saved-room dashboard
-- Drop a video → host plays immediately from the original file
-- File uploads directly to Mux (not through Railway body limits)
-- When Mux is ready, the whole room switches to the shared HLS URL (synced via Socket.IO)
+- File uploads go directly to Mux (not through Railway body limits) and are saved
+  to the room library before they are independently added to the queue
+- Privileged members can save browser-probed direct media URLs without the Flask
+  server fetching or proxying the submitted URL
+- Playback, queue, library, permissions, requests, and presence synchronize over
+  authoritative Socket.IO room state
 - The backend stores reusable media separately from stable-ID queue entries
 - Room owners are implicitly fully privileged; other members are viewers until granted permissions
+- Anonymous guests can watch active rooms and submit validated action requests;
+  reviewers approve through the same permission-checked command services
 - Finishing a video removes only its queue entry; the saved media and Mux asset remain

@@ -47,6 +47,18 @@ class Actor:
     def is_user(self) -> bool:
         return self.kind == "user" and self.user_id is not None
 
+    @property
+    def is_guest(self) -> bool:
+        return self.kind == "guest" and bool(self.guest_id)
+
+    @property
+    def key(self) -> str:
+        if self.is_user:
+            return f"user:{self.user_id}"
+        if self.is_guest:
+            return f"guest:{self.guest_id}"
+        return "anonymous"
+
 
 def actor_for_user(user: User | object) -> Actor:
     if not getattr(user, "is_authenticated", False):
@@ -67,9 +79,11 @@ def membership_for(room_id: int, user_id: int | None) -> RoomMembership | None:
 
 
 def can_view_room(room: WatchRoom | None, actor: Actor) -> bool:
-    if not room or room.archived_at is not None or not actor.is_user:
-        return False
-    return room.owner_id == actor.user_id or membership_for(room.id, actor.user_id) is not None
+    return bool(
+        room
+        and room.archived_at is None
+        and (actor.is_user or actor.is_guest)
+    )
 
 
 def permissions_for(room: WatchRoom, actor: Actor) -> frozenset[Permission]:

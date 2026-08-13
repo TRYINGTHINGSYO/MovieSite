@@ -31,8 +31,6 @@ class MuxSourceAdapter:
             "source_id": source.id,
             "source_type": self.source_type,
             "status": source.status,
-            "mux_upload_id": mux.upload_id if mux else None,
-            "asset_id": mux.asset_id if mux else None,
             "playback_id": mux.playback_id if mux else None,
             "url": (
                 f"https://stream.mux.com/{mux.playback_id}.m3u8"
@@ -58,7 +56,12 @@ class DirectUrlSourceAdapter:
             "status": source.status,
             "url": direct.normalized_url if direct else None,
             "error": source.error,
-            "availability": "browser_probe_required",
+            "probe_result": direct.probe_result if direct else "not_probed",
+            "availability": (
+                "remote"
+                if source.status == "ready"
+                else "browser_probe_required"
+            ),
         }
 
 

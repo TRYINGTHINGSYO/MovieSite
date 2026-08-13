@@ -204,7 +204,8 @@ def test_upload_uses_database_max_order_and_cleans_mux_on_commit_failure(
     assert response.status_code == 200
     with app.app_context():
         room = db.session.scalar(select(WatchRoom).where(WatchRoom.code == code))
-        assert [entry.position for entry in room.queue_entries] == [1, 2]
+        assert [entry.position for entry in room.queue_entries] == [1]
+        assert len(room.library_items) == 3
 
     failed_response = Mock(ok=True)
     failed_response.json.return_value = {

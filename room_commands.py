@@ -6,9 +6,10 @@ from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 
-from authorization import Actor, Permission, lock_room_for
+from authorization import Actor, Permission, lock_room_for, require_permission
 from media_sources import MUX_UPLOAD
 from models import (
+    DirectUrlSource,
     MediaAsset,
     MediaCleanupJob,
     MediaSource,
@@ -18,6 +19,8 @@ from models import (
     WatchRoom,
     db,
 )
+
+from direct_urls import ValidatedDirectUrl
 
 
 class CommandError(Exception):
@@ -30,6 +33,9 @@ class VersionConflictError(CommandError):
 
 class ResourceNotFoundError(CommandError):
     pass
+
+
+MAX_PLAYBACK_SECONDS = 7 * 24 * 60 * 60
 
 
 def new_id() -> str:
@@ -71,16 +77,12 @@ def create_mux_media(
     source_id: str | None = None,
     room_media_id: str | None = None,
     queue_entry_id: str | None = None,
-) -> tuple[WatchRoom, QueueEntry, MediaSource, MuxMediaSource]:
+    enqueue: bool = True,
+) -> tuple[WatchRoom, QueueEntry | None, MediaSource, MuxMediaSource]:
     room = lock_room_for(room_id, actor, Permission.ADD_MEDIA)
-    next_position = (
-        db.session.scalar(
-            select(func.coalesce(func.max(QueueEntry.position), -1)).where(
-                QueueEntry.room_id == room.id
-            )
-        )
-        + 1
-    )
+    if enqueue:
+        # Saving media and changing the queue are separate capabilities.
+        require_permission(room, actor, Permission.MANAGE_QUEUE)
 
     asset = MediaAsset(
         id=asset_id or new_id(),
@@ -101,24 +103,82 @@ def create_mux_media(
         asset=asset,
         added_by_id=actor.user_id,
     )
-    entry = QueueEntry(
-        id=queue_entry_id or new_id(),
-        room_id=room.id,
-        room_media=room_media,
-        position=next_position,
-        added_by_id=actor.user_id,
-    )
-    db.session.add_all([asset, source, mux, room_media, entry])
+    entry = None
+    if enqueue:
+        next_position = (
+            db.session.scalar(
+                select(func.coalesce(func.max(QueueEntry.position), -1)).where(
+                    QueueEntry.room_id == room.id
+                )
+            )
+            + 1
+        )
+        entry = QueueEntry(
+            id=queue_entry_id or new_id(),
+            room_id=room.id,
+            room_media=room_media,
+            position=next_position,
+            added_by_id=actor.user_id,
+        )
+    db.session.add_all([asset, source, mux, room_media])
+    if entry is not None:
+        db.session.add(entry)
     db.session.flush()
 
-    room.queue_version += 1
-    if room.current_queue_entry_id is None:
+    if entry is not None:
+        room.queue_version += 1
+    if entry is not None and room.current_queue_entry_id is None:
         room.current_queue_entry_id = entry.id
         room.playing = True
         room.position = 0.0
         room.playback_updated_at = datetime.now(UTC)
         room.playback_version += 1
     return room, entry, source, mux
+
+
+def create_direct_media(
+    room_id: int,
+    actor: Actor,
+    title: str,
+    validated_url: ValidatedDirectUrl,
+    *,
+    probe_result: str = "not_probed",
+    asset_id: str | None = None,
+    source_id: str | None = None,
+    room_media_id: str | None = None,
+) -> tuple[WatchRoom, RoomMedia, MediaSource, DirectUrlSource]:
+    room = lock_room_for(room_id, actor, Permission.ADD_MEDIA)
+    clean_title = str(title or "").strip()[:255] or "Direct media"
+    asset = MediaAsset(
+        id=asset_id or new_id(),
+        title=clean_title,
+        created_by_id=actor.user_id,
+    )
+    source = MediaSource(
+        id=source_id or new_id(),
+        asset=asset,
+        source_type="direct_url",
+        status="ready" if probe_result in {"playable", "playable_no_seek"} else "unverified",
+        error=None if probe_result in {"playable", "playable_no_seek"} else probe_result,
+    )
+    direct = DirectUrlSource(
+        source=source,
+        original_url=validated_url.original,
+        normalized_url=validated_url.normalized,
+        probe_result=probe_result,
+        last_probed_at=(
+            datetime.now(UTC) if probe_result != "not_probed" else None
+        ),
+    )
+    room_media = RoomMedia(
+        id=room_media_id or new_id(),
+        room_id=room.id,
+        asset=asset,
+        added_by_id=actor.user_id,
+    )
+    db.session.add_all([asset, source, direct, room_media])
+    db.session.flush()
+    return room, room_media, source, direct
 
 
 def add_saved_media_to_queue(
@@ -129,7 +189,7 @@ def add_saved_media_to_queue(
     expected_queue_version: int | None = None,
     queue_entry_id: str | None = None,
 ) -> tuple[WatchRoom, QueueEntry]:
-    room = lock_room_for(room_id, actor, Permission.ADD_MEDIA)
+    room = lock_room_for(room_id, actor, Permission.MANAGE_QUEUE)
     _check_version(room.queue_version, expected_queue_version, "queue")
     room_media = db.session.scalar(
         select(RoomMedia).where(
@@ -206,6 +266,30 @@ def remove_queue_entry(
     if entry is None:
         raise ResourceNotFoundError("Queue entry not found")
     _remove_entry_and_advance(room, entry, continue_playing=room.playing)
+    return room
+
+
+def clear_upcoming_queue(
+    room_id: int,
+    actor: Actor,
+    *,
+    expected_queue_version: int | None,
+) -> WatchRoom:
+    room = lock_room_for(room_id, actor, Permission.MANAGE_QUEUE)
+    _check_version(room.queue_version, expected_queue_version, "queue")
+    entries = queue_entries_for(room.id)
+    if room.current_queue_entry_id is None:
+        removable = entries
+    else:
+        current = queue_entry_for(room.id, room.current_queue_entry_id)
+        current_position = current.position if current is not None else -1
+        removable = [entry for entry in entries if entry.position > current_position]
+    if not removable:
+        return room
+    for entry in removable:
+        db.session.delete(entry)
+    db.session.flush()
+    room.queue_version += 1
     return room
 
 
@@ -315,8 +399,11 @@ def _remove_entry_and_advance(
         raise ResourceNotFoundError("Queue entry not found") from exc
     remaining = [item for item in entries if item.id != entry.id]
     if room.current_queue_entry_id == entry.id:
-        if remaining:
-            next_entry = remaining[min(removed_index, len(remaining) - 1)]
+        # The next queue item is the entry that occupied the removed entry's
+        # index. Entries before a manually selected current item are history,
+        # not a fallback that should unexpectedly replay at end-of-queue.
+        next_entry = remaining[removed_index] if removed_index < len(remaining) else None
+        if next_entry is not None:
             room.current_queue_entry_id = next_entry.id
             room.playing = bool(continue_playing)
         else:
@@ -340,10 +427,13 @@ def _check_version(
 
 
 def _valid_position(value: float) -> float:
-    try:
-        position = float(value)
-    except (TypeError, ValueError) as exc:
-        raise CommandError("Playback position must be a number") from exc
-    if not math.isfinite(position) or position < 0:
-        raise CommandError("Playback position must be finite and nonnegative")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CommandError("Playback position must be a number")
+    position = float(value)
+    if (
+        not math.isfinite(position)
+        or position < 0
+        or position > MAX_PLAYBACK_SECONDS
+    ):
+        raise CommandError("Playback position is outside the allowed range")
     return position

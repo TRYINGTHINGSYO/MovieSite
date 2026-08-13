@@ -9,7 +9,7 @@ def test_unauthenticated_socket_connection_is_rejected(app, client):
     assert not socket_client.is_connected()
 
 
-def test_socket_room_join_requires_membership(app, client, register):
+def test_socket_room_join_allows_read_only_nonmember(app, client, register):
     register(email="owner@example.com")
     code = create_room(client)
     client.post("/logout")
@@ -18,10 +18,8 @@ def test_socket_room_join_requires_membership(app, client, register):
     socket_client = socketio.test_client(app, flask_test_client=client)
     socket_client.emit("join", {"code": code})
     received = socket_client.get_received()
-    assert any(
-        event["name"] == "error" and "access denied" in event["args"][0]["message"]
-        for event in received
-    )
+    state_event = next(event for event in received if event["name"] == "state_sync")
+    assert state_event["args"][0]["capabilities"] == []
     socket_client.disconnect()
 
 

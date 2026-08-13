@@ -61,6 +61,7 @@ def test_postgres_migration_and_row_locking():
                 "queue_entries",
                 "room_member_permissions",
                 "room_requests",
+                "room_command_receipts",
                 "media_cleanup_jobs",
             } <= set(tables)
             connection.execute(

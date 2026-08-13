@@ -98,8 +98,8 @@ def test_joining_room_saves_idempotent_membership(app, client, register):
     register(email="guest@example.com")
 
     invite = client.get(f"/session/{code}")
-    assert invite.status_code == 403
-    assert b"Join this room" in invite.data
+    assert invite.status_code == 200
+    assert b"Requests" in invite.data
 
     first = client.post("/join", data={"code": code.lower()})
     second = client.post("/join", data={"code": code})

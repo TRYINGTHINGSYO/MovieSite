@@ -262,6 +262,13 @@ class MuxMediaSource(db.Model):
 
 class DirectUrlSource(db.Model):
     __tablename__ = "direct_url_sources"
+    __table_args__ = (
+        CheckConstraint(
+            "probe_result IN ('not_probed', 'playable', 'playable_no_seek', "
+            "'unsupported_format', 'network_or_cors_failure', 'unavailable')",
+            name="ck_direct_url_sources_probe_result",
+        ),
+    )
 
     source_id = db.Column(
         db.String(32),
@@ -271,6 +278,9 @@ class DirectUrlSource(db.Model):
     original_url = db.Column(db.Text, nullable=False)
     normalized_url = db.Column(db.Text, nullable=False)
     observed_content_type = db.Column(db.String(127))
+    probe_result = db.Column(
+        db.String(32), nullable=False, default="not_probed", server_default="not_probed"
+    )
     last_probed_at = db.Column(db.DateTime(timezone=True))
 
     source = db.relationship("MediaSource", back_populates="direct_url")
@@ -474,6 +484,37 @@ class RoomRequest(db.Model):
     room = db.relationship("WatchRoom")
     requester_user = db.relationship("User", foreign_keys=[requester_user_id])
     resolved_by = db.relationship("User", foreign_keys=[resolved_by_id])
+
+
+class RoomCommandReceipt(db.Model):
+    """Durable idempotency receipt for client-originated room commands."""
+
+    __tablename__ = "room_command_receipts"
+    __table_args__ = (
+        UniqueConstraint("room_id", "actor_key", "client_action_id"),
+        CheckConstraint(
+            "actor_kind IN ('user', 'guest')",
+            name="ck_room_command_receipts_actor_kind",
+        ),
+    )
+
+    id = db.Column(db.String(32), primary_key=True)
+    room_id = db.Column(
+        db.Integer,
+        db.ForeignKey("watch_rooms.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    actor_kind = db.Column(db.String(12), nullable=False)
+    actor_key = db.Column(db.String(96), nullable=False)
+    client_action_id = db.Column(db.String(64), nullable=False)
+    command_type = db.Column(db.String(40), nullable=False)
+    result = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    room = db.relationship("WatchRoom")
 
 
 class MediaCleanupJob(db.Model):

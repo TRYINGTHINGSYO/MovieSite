@@ -7,15 +7,14 @@
   <meta name="csrf-token" content="{{ csrf_token() }}" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/theater.css') }}" />
 </head>
-<body class="page-room" data-code="{{ code }}">
+<body class="page-room stage2b-room" data-code="{{ code }}">
   <div class="ambient ambient-room" aria-hidden="true"></div>
 
-  <header class="room-header">
-    <a class="brand-mini" href="{{ url_for('saved_rooms') }}">Group Theater</a>
-
+  <header class="room-header stage2b-header">
+    <a class="brand-mini" href="{{ url_for('saved_rooms') if actor.is_user else url_for('landing') }}">Group Theater</a>
     <div class="ticket" id="ticket">
       <div class="ticket-stub">
         <span class="ticket-label">{{ room.name }} · session</span>
@@ -24,44 +23,26 @@
       <div class="ticket-perforation" aria-hidden="true"></div>
       <div class="ticket-actions">
         <button type="button" class="btn btn-sm btn-gold" id="copy-link">Copy invite link</button>
-        <button type="button" class="btn btn-sm btn-ghost" id="download-original" hidden>Download original</button>
         <span class="copy-feedback" id="copy-feedback" hidden>Copied</span>
       </div>
     </div>
-
-    <p class="viewer-badge" id="viewer-badge">
-      <span id="viewer-count">1</span> in the house
-    </p>
+    <p class="viewer-badge"><span id="viewer-count">1</span> in the house</p>
   </header>
 
-  <main class="room-main">
-    <section class="screen-stage" id="screen-stage">
+  <main class="room-main stage2b-main">
+    <section class="screen-stage" aria-label="Shared playback">
       <div class="screen-frame" id="drop-zone">
         <div class="drop-prompt" id="drop-prompt">
           <p class="drop-title">The screen is ready</p>
-          <p class="drop-sub">Use + Add video below, or drag a file onto this screen</p>
+          <p class="drop-sub">Choose saved media or add something to the queue.</p>
         </div>
-        <video id="player" class="player" controls playsinline preload="auto" hidden></video>
-        <mux-player
-          id="mux-player"
-          class="player mux-player"
-          stream-type="on-demand"
-          playsinline
-          preload="auto"
-          crossorigin="anonymous"
-          primary-color="#F5F1E8"
-          secondary-color="rgba(14, 14, 16, 0.82)"
-          accent-color="#E8B84B"
-          hidden
-        ></mux-player>
+        <video id="player" class="player" controls playsinline preload="metadata" hidden></video>
+        <mux-player id="mux-player" class="player mux-player" stream-type="on-demand" playsinline preload="auto" crossorigin="anonymous" primary-color="#F5F1E8" secondary-color="rgba(14, 14, 16, 0.82)" accent-color="#E8B84B" hidden></mux-player>
         <div class="prepare-banner" id="prepare-banner" hidden></div>
-        <button type="button" class="tap-to-play" id="tap-to-play" hidden>
-          <span class="tap-to-play-icon" aria-hidden="true">▶</span>
-          <span class="tap-to-play-label">Tap to play with the room</span>
-        </button>
+        <button type="button" class="tap-to-play" id="tap-to-play" hidden>Tap to watch with the room</button>
         <div class="player-error" id="player-error" hidden>
-          <p class="drop-title">Can't play this file</p>
-          <p class="drop-sub" id="player-error-detail">Try another video, or check Mux credentials on the server.</p>
+          <p class="drop-title">This media is unavailable</p>
+          <p class="drop-sub" id="player-error-detail"></p>
         </div>
         <div class="upload-progress" id="upload-progress" hidden>
           <div class="upload-bar"><div class="upload-fill" id="upload-fill"></div></div>
@@ -69,40 +50,59 @@
         </div>
         <input type="file" id="file-input" accept="video/*" multiple hidden />
       </div>
+
+      <div class="playback-toolbar" aria-label="Room playback controls">
+        <button type="button" class="btn btn-sm btn-velvet" id="play-action">Play</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="pause-action">Pause</button>
+        <label class="seek-control">Seek <input type="number" id="seek-position" min="0" max="604800" step="1" value="0" /></label>
+        <button type="button" class="btn btn-sm btn-ghost" id="seek-action">Seek</button>
+        <button type="button" class="btn btn-sm btn-ghost" id="next-action">Next</button>
+        <span class="capability-note" id="playback-mode"></span>
+      </div>
       {% if not mux_ready %}
-      <p class="mux-warning">Set <code>MUX_TOKEN_ID</code> and <code>MUX_TOKEN_SECRET</code> on Railway so shared playback works.</p>
+      <p class="mux-warning">Mux uploads are unavailable until the server credentials are configured. Direct URLs still work.</p>
       {% endif %}
     </section>
 
-    <div class="film-strip" aria-hidden="true">
-      <span></span><span></span><span></span><span></span>
-      <span></span><span></span><span></span><span></span>
-      <span></span><span></span><span></span><span></span>
-    </div>
+    <p class="room-notice" id="room-notice" role="status" hidden></p>
 
-    <section class="below-screen">
-      <div class="queue-panel">
-        <div class="queue-head">
-          <h2>Queue</h2>
-          <button type="button" class="btn btn-sm btn-velvet" id="add-more">+ Add video</button>
+    <section class="room-workspace">
+      <article class="workspace-panel" id="media-panel">
+        <div class="panel-heading">
+          <div><span class="panel-kicker">Library</span><h2>Media</h2></div>
+          <button type="button" class="btn btn-sm btn-velvet" id="upload-media">Upload to Mux</button>
         </div>
-        <ol class="queue-list" id="queue-list">
-          <li class="queue-empty" id="queue-empty">Nothing queued yet — drag a file onto the screen.</li>
-        </ol>
-      </div>
+        <form class="direct-url-form" id="direct-url-form">
+          <label>Title <input id="direct-title" maxlength="255" placeholder="Movie title" /></label>
+          <label>Direct media URL <input id="direct-url" type="url" maxlength="4096" required placeholder="https://cdn.example.com/movie.mp4" /></label>
+          <button type="submit" class="btn btn-sm btn-gold" id="direct-submit">Probe &amp; save</button>
+          <span class="probe-result" id="probe-result"></span>
+        </form>
+        <ul class="resource-list" id="library-list"></ul>
+        <p class="empty-message" id="library-empty">No saved media yet.</p>
+      </article>
 
-      <div class="house">
-        <h2 class="house-title">The house</h2>
-        <div class="theater" id="seat-grid" aria-label="Viewer presence seats">
-          {% for r in range(8) %}
-          <div class="row">
-            {% for c in range(12) %}
-            <div class="seat" data-seat="{{ r * 12 + c }}"></div>
-            {% endfor %}
-          </div>
-          {% endfor %}
+      <article class="workspace-panel" id="queue-panel">
+        <div class="panel-heading">
+          <div><span class="panel-kicker">Now &amp; next</span><h2>Queue</h2></div>
+          <button type="button" class="btn btn-sm btn-ghost" id="clear-upcoming">Clear upcoming</button>
         </div>
-      </div>
+        <ol class="resource-list queue-resource-list" id="queue-list"></ol>
+        <p class="empty-message" id="queue-empty">Nothing queued yet.</p>
+      </article>
+
+      <article class="workspace-panel" id="people-panel">
+        <div class="panel-heading"><div><span class="panel-kicker">Access</span><h2>People</h2></div></div>
+        <ul class="resource-list" id="people-list"></ul>
+        <h3 class="panel-subheading">Present now</h3>
+        <ul class="presence-list" id="presence-list"></ul>
+      </article>
+
+      <article class="workspace-panel" id="requests-panel">
+        <div class="panel-heading"><div><span class="panel-kicker">Viewer actions</span><h2>Requests</h2></div></div>
+        <ul class="resource-list" id="requests-list"></ul>
+        <p class="empty-message" id="requests-empty">No requests to show.</p>
+      </article>
     </section>
   </main>
 
