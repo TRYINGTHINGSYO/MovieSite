@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
@@ -25,7 +26,7 @@ from flask_login import (
 from flask_migrate import Migrate
 from flask_socketio import SocketIO, disconnect, emit, join_room, leave_room
 from flask_wtf.csrf import CSRFProtect
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
@@ -241,6 +242,52 @@ def room_for_code(code: str) -> WatchRoom | None:
             WatchRoom.code == code.upper(), WatchRoom.archived_at.is_(None)
         )
     )
+
+
+def room_accent_hue(code: str) -> int:
+    return int(hashlib.sha256(code.encode("utf-8")).hexdigest()[:4], 16) % 360
+
+
+def disconnect_room_viewers(code: str) -> None:
+    for sid in [sid for sid, joined in sid_to_code.items() if joined == code]:
+        revoked_sids.add(sid)
+        socketio.server.disconnect(sid, namespace="/")
+
+
+def saved_room_cards(user_id: int) -> list[dict]:
+    memberships = list(
+        db.session.scalars(
+            select(RoomMembership)
+            .join(RoomMembership.room)
+            .where(
+                RoomMembership.user_id == user_id,
+                WatchRoom.archived_at.is_(None),
+            )
+            .order_by(WatchRoom.updated_at.desc(), WatchRoom.id.desc())
+        ).all()
+    )
+    room_ids = [membership.room_id for membership in memberships]
+    member_counts = {}
+    if room_ids:
+        member_counts = dict(
+            db.session.execute(
+                select(RoomMembership.room_id, func.count())
+                .where(RoomMembership.room_id.in_(room_ids))
+                .group_by(RoomMembership.room_id)
+            ).all()
+        )
+    cards = []
+    for membership in memberships:
+        room = membership.room
+        cards.append(
+            {
+                "room": room,
+                "is_owner": room.owner_id == user_id,
+                "member_count": int(member_counts.get(room.id, 1)),
+                "accent": room_accent_hue(room.code),
+            }
+        )
+    return cards
 
 
 def lock_room(room_id: int) -> WatchRoom | None:
@@ -615,16 +662,7 @@ def logout():
 @app.route("/rooms")
 @login_required
 def saved_rooms():
-    memberships = db.session.scalars(
-        select(RoomMembership)
-        .join(RoomMembership.room)
-        .where(
-            RoomMembership.user_id == current_user.id,
-            WatchRoom.archived_at.is_(None),
-        )
-        .order_by(WatchRoom.updated_at.desc())
-    ).all()
-    return render_template("rooms.html", memberships=memberships)
+    return render_template("rooms.html", rooms=saved_room_cards(current_user.id))
 
 
 @app.route("/create", methods=["POST"])
@@ -664,6 +702,42 @@ def join_session():
     return redirect(url_for("session_room", code=code))
 
 
+@app.route("/rooms/<code>/delete", methods=["POST"])
+@login_required
+def delete_saved_room(code: str):
+    room = room_for_code(code)
+    if room is None:
+        flash("That room has already been removed.")
+        return redirect(url_for("saved_rooms"))
+    if room.owner_id != current_user.id:
+        flash("Only the owner can remove this room.")
+        return redirect(url_for("saved_rooms"))
+    room.archived_at = datetime.now(UTC)
+    db.session.commit()
+    disconnect_room_viewers(room.code)
+    flash(f"Removed {room.name}.")
+    return redirect(url_for("saved_rooms"))
+
+
+@app.route("/rooms/<code>/leave", methods=["POST"])
+@login_required
+def leave_saved_room(code: str):
+    room = room_for_code(code)
+    if room is None:
+        flash("That room has already been removed.")
+        return redirect(url_for("saved_rooms"))
+    if room.owner_id == current_user.id:
+        flash("Owners remove a room instead of leaving it.")
+        return redirect(url_for("saved_rooms"))
+    membership = db.session.get(RoomMembership, (room.id, current_user.id))
+    if membership is None:
+        return redirect(url_for("saved_rooms"))
+    db.session.delete(membership)
+    db.session.commit()
+    flash(f"Left {room.name}.")
+    return redirect(url_for("saved_rooms"))
+
+
 @app.route("/session/<code>")
 @limiter.limit("60 per hour")
 def session_room(code: str):
@@ -673,6 +747,9 @@ def session_room(code: str):
         return redirect(url_for("saved_rooms" if current_user.is_authenticated else "landing"))
     if not user_can_access(room):
         return {"error": "Room not found or inactive"}, 404
+    if current_user.is_authenticated:
+        room.updated_at = datetime.now(UTC)
+        db.session.commit()
     actor = current_actor()
     return render_template(
         "room.html",

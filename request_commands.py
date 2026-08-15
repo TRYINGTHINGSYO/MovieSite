@@ -36,7 +36,6 @@ from room_commands import (
 
 
 REQUEST_TTL = timedelta(minutes=15)
-MAX_PENDING_PER_REQUESTER = 5
 MAX_PENDING_PER_ROOM = 50
 MAX_SEEK_SECONDS = 7 * 24 * 60 * 60
 REQUEST_TYPES = frozenset(
@@ -93,14 +92,23 @@ def request_to_public(item: RoomRequest) -> dict:
 
 
 def visible_requests(room: WatchRoom, actor: Actor) -> list[RoomRequest]:
+    expire_pending_requests(room.id)
     statement = select(RoomRequest).where(RoomRequest.room_id == room.id)
     if Permission.REVIEW_REQUESTS not in permissions_for(room, actor):
         statement = statement.where(RoomRequest.requester_key == actor.key)
-    return list(
+    items = list(
         db.session.scalars(
-            statement.order_by(RoomRequest.created_at.desc(), RoomRequest.id.desc()).limit(100)
+            statement.order_by(RoomRequest.created_at.desc(), RoomRequest.id.desc())
         ).all()
     )
+    latest = []
+    seen = set()
+    for item in items:
+        if item.requester_key in seen:
+            continue
+        seen.add(item.requester_key)
+        latest.append(item)
+    return latest
 
 
 def create_room_request(
@@ -149,15 +157,21 @@ def create_room_request(
         return existing, False
 
     expire_pending_requests(room.id)
-    pending_for_identity = db.session.scalar(
-        select(func.count(RoomRequest.id)).where(
-            RoomRequest.room_id == room.id,
-            RoomRequest.requester_key == actor.key,
-            RoomRequest.status == "pending",
-        )
+    now = datetime.now(UTC)
+    pending_for_identity = list(
+        db.session.scalars(
+            select(RoomRequest).where(
+                RoomRequest.room_id == room.id,
+                RoomRequest.requester_key == actor.key,
+                RoomRequest.status == "pending",
+            )
+        ).all()
     )
-    if pending_for_identity >= MAX_PENDING_PER_REQUESTER:
-        raise RequestValidationError("Too many pending requests")
+    for previous in pending_for_identity:
+        previous.status = "dismissed"
+        previous.resolved_at = now
+    if pending_for_identity:
+        db.session.flush()
     pending_for_room = db.session.scalar(
         select(func.count(RoomRequest.id)).where(
             RoomRequest.room_id == room.id,
@@ -167,7 +181,6 @@ def create_room_request(
     if pending_for_room >= MAX_PENDING_PER_ROOM:
         raise RequestValidationError("This room has too many pending requests")
 
-    now = datetime.now(UTC)
     item = RoomRequest(
         id=new_id(),
         room_id=room.id,

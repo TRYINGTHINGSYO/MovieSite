@@ -482,16 +482,21 @@ import {
     const list = $("requests-list");
     list.replaceChildren();
     $("requests-empty").hidden = state.requests.length > 0;
+    const labels = { approved: "Approve", denied: "Deny", dismissed: "Dismiss" };
     for (const item of state.requests) {
-      const row = node("li", "request-row");
+      const row = node("li", `request-row request-${item.status || "pending"}`);
       const summary = node("div", "resource-summary");
       summary.append(node("strong", "resource-title", item.requester_label));
-      summary.append(node("span", "resource-meta", `${describeRequest(item)} · ${item.status}`));
+      const meta = node("span", "resource-meta");
+      meta.append(node("span", "", describeRequest(item)));
+      meta.append(document.createTextNode(" · "));
+      meta.append(node("span", `request-status status-${item.status}`, item.status));
+      summary.append(meta);
       row.append(summary);
       if (can("REVIEW_REQUESTS") && item.status === "pending") {
         const actions = node("div", "resource-actions");
         for (const decision of ["approved", "denied", "dismissed"]) {
-          actions.append(button(decision, "btn btn-sm btn-ghost", () => {
+          actions.append(button(labels[decision], "btn btn-sm btn-ghost", () => {
             api(`/api/rooms/${code}/requests/${item.id}/resolve`, {
               method: "POST",
               body: JSON.stringify({ resolution: decision }),

@@ -4,6 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Your rooms · Group Theater</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="{{ url_for('static', filename='css/theater.css') }}" />
 </head>
 <body class="page-room">
@@ -18,25 +21,48 @@
   <main class="dashboard">
     <p class="eyebrow">Your screenings</p>
     <h1 class="dashboard-title">Saved rooms</h1>
+    <p class="dashboard-lede">Every room gets a fresh invite code. Open one to pick up where the house left off, or start a new screening.</p>
     {% with messages = get_flashed_messages() %}{% if messages %}<ul class="flash" role="alert">{% for message in messages %}<li>{{ message }}</li>{% endfor %}</ul>{% endif %}{% endwith %}
     <section class="dashboard-actions">
       <form action="{{ url_for('create_session') }}" method="post" class="room-action-card">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
         <label for="room-name">Create a room</label>
+        <p class="card-hint">A new code is issued each time you create.</p>
         <div class="join-form"><input id="room-name" name="name" maxlength="120" placeholder="Friday night movies" /><button class="btn btn-gold" type="submit">Create</button></div>
       </form>
       <form action="{{ url_for('join_session') }}" method="post" class="room-action-card">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
         <label for="room-code">Join with a code</label>
+        <p class="card-hint">Use the 8-character invite from a friend.</p>
         <div class="join-form"><input id="room-code" name="code" class="code-input" maxlength="8" placeholder="7F3K2ABC" required /><button class="btn btn-velvet" type="submit">Join</button></div>
       </form>
     </section>
     <section class="saved-room-list">
-      {% for membership in memberships %}
-      <a class="saved-room" href="{{ url_for('session_room', code=membership.room.code) }}">
-        <span><strong>{{ membership.room.name }}</strong><small>{{ 'Owner' if membership.room.owner_id == current_user.id else 'Member' }}</small></span>
-        <code>{{ membership.room.code }}</code>
-      </a>
+      {% for card in rooms %}
+      <article class="saved-room-card" style="--room-accent: {{ card.accent }}">
+        <a class="saved-room" href="{{ url_for('session_room', code=card.room.code) }}">
+          <span class="saved-room-copy">
+            <strong>{{ card.room.name }}</strong>
+            <small>
+              {{ 'Owner' if card.is_owner else 'Member' }}
+              · {{ card.member_count }} {{ 'person' if card.member_count == 1 else 'people' }}
+              {% if card.room.updated_at %} · {{ card.room.updated_at.strftime('%b %d') }}{% endif %}
+            </small>
+          </span>
+          <code>{{ card.room.code }}</code>
+        </a>
+        {% if card.is_owner %}
+        <form action="{{ url_for('delete_saved_room', code=card.room.code) }}" method="post" class="saved-room-remove" onsubmit="return confirm({{ ('Remove ' ~ card.room.name ~ ' for everyone?')|tojson }})">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <button class="btn btn-sm btn-danger-ghost" type="submit">Remove</button>
+        </form>
+        {% else %}
+        <form action="{{ url_for('leave_saved_room', code=card.room.code) }}" method="post" class="saved-room-remove" onsubmit="return confirm({{ ('Leave ' ~ card.room.name ~ '?')|tojson }})">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+          <button class="btn btn-sm btn-danger-ghost" type="submit">Leave</button>
+        </form>
+        {% endif %}
+      </article>
       {% else %}
       <p class="rooms-empty">No saved rooms yet. Create one or join with an invite code.</p>
       {% endfor %}

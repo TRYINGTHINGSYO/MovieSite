@@ -693,18 +693,39 @@ def test_requests_are_validated_idempotent_bounded_and_cross_room_safe(
     assert second.status_code == 200
     assert first.get_json()["request"]["id"] == second.get_json()["request"]["id"]
 
+    latest = None
     for index in range(4):
         response = guest.post(
             f"/api/rooms/{code}/requests",
             json={"request_type": "PAUSE", "payload": {}, "client_request_id": f"pending{index:05d}"},
         )
         assert response.status_code == 201
-    limited = guest.post(
+        latest = response.get_json()["request"]
+    replaced = guest.post(
         f"/api/rooms/{code}/requests",
         json={"request_type": "PLAY", "payload": {}, "client_request_id": "pendinglimit1"},
     )
-    assert limited.status_code == 400
-    assert "Too many" in limited.get_json()["error"]
+    assert replaced.status_code == 201
+    assert replaced.get_json()["request"]["request_type"] == "PLAY"
+    owner_state = client.get(f"/api/rooms/{code}/state").get_json()["state"]
+    guest_state = guest.get(f"/api/rooms/{code}/state").get_json()["state"]
+    assert len(owner_state["requests"]) == 1
+    assert owner_state["requests"][0]["id"] == replaced.get_json()["request"]["id"]
+    assert owner_state["requests"][0]["status"] == "pending"
+    assert len(guest_state["requests"]) == 1
+    assert guest_state["requests"][0]["request_type"] == "PLAY"
+    with app.app_context():
+        pending = db.session.scalars(
+            select(RoomRequest).where(
+                RoomRequest.status == "pending",
+                RoomRequest.room_id == db.session.scalar(
+                    select(WatchRoom.id).where(WatchRoom.code == code)
+                ),
+            )
+        ).all()
+        assert len(pending) == 1
+        assert latest is not None
+        assert db.session.get(RoomRequest, latest["id"]).status == "dismissed"
 
 
 def test_requests_reject_extra_fields_bad_probe_and_idempotency_key_reuse(

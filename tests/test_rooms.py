@@ -99,7 +99,7 @@ def test_joining_room_saves_idempotent_membership(app, client, register):
 
     invite = client.get(f"/session/{code}")
     assert invite.status_code == 200
-    assert b"Requests" in invite.data
+    assert b"Latest request" in invite.data
 
     first = client.post("/join", data={"code": code.lower()})
     second = client.post("/join", data={"code": code})
@@ -130,6 +130,59 @@ def test_dashboard_only_lists_joined_rooms(app, client, register):
     dashboard = client.get("/rooms")
     assert owned_code.encode() in dashboard.data
     assert other_code.encode() not in dashboard.data
+    assert b"Remove" in dashboard.data
+    assert b"Leave" not in dashboard.data
+
+
+def test_each_created_room_gets_a_new_code(app, client, register):
+    register()
+    first = create_room(client, "YouTube")
+    second = create_room(client, "YouTube")
+    assert first != second
+    dashboard = client.get("/rooms")
+    assert first.encode() in dashboard.data
+    assert second.encode() in dashboard.data
+    assert dashboard.data.count(b"YouTube") >= 2
+
+
+def test_owner_can_remove_room_and_member_can_leave(app, client, register):
+    register(email="owner@example.com")
+    code = create_room(client, "YouTube")
+    client.post("/logout")
+    member = app.test_client()
+    member.post(
+        "/register",
+        data={
+            "email": "member@example.com",
+            "password": "correct-horse",
+            "display_name": "Member",
+        },
+    )
+    assert member.post("/join", data={"code": code}).status_code == 302
+    member_dashboard = member.get("/rooms")
+    assert b"Leave" in member_dashboard.data
+    assert b"Remove" not in member_dashboard.data
+    assert member.post(f"/rooms/{code}/delete").status_code == 302
+    assert member.get(f"/session/{code}").status_code == 200
+
+    left = member.post(f"/rooms/{code}/leave", follow_redirects=True)
+    assert left.status_code == 200
+    assert code.encode() not in member.get("/rooms").data
+
+    owner = app.test_client()
+    owner.post(
+        "/login",
+        data={"email": "owner@example.com", "password": "correct-horse"},
+    )
+    assert owner.post(f"/rooms/{code}/leave", follow_redirects=True).status_code == 200
+    assert code.encode() in owner.get("/rooms").data
+    removed = owner.post(f"/rooms/{code}/delete", follow_redirects=True)
+    assert removed.status_code == 200
+    assert code.encode() not in owner.get("/rooms").data
+    assert owner.get(f"/session/{code}").status_code == 302
+    with app.app_context():
+        room = db.session.scalar(select(WatchRoom).where(WatchRoom.code == code))
+        assert room.archived_at is not None
 
 
 def test_playback_state_survives_database_session_reload(app, client, register):
