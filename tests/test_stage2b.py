@@ -119,20 +119,25 @@ def test_privileged_direct_url_save_is_separate_and_never_fetches_server_side(
     "probe_result",
     ["not_probed", "unsupported_format", "network_or_cors_failure", "unavailable"],
 )
-def test_direct_url_save_requires_a_successful_browser_probe(
+def test_direct_url_save_requires_a_successful_browser_probe_or_extract(
     app, client, register, probe_result
 ):
     register()
     code = create_room(client)
-    response = client.post(
-        f"/api/rooms/{code}/media/direct-url",
-        json={
-            "title": "Rejected probe",
-            "url": "https://media.example.com/rejected.mp4",
-            "probe_result": probe_result,
-        },
-    )
+    with patch("movie_theater.extract_clip") as extract:
+        extract.side_effect = DirectUrlError(
+            "Could not extract a playable clip from that link"
+        )
+        response = client.post(
+            f"/api/rooms/{code}/media/direct-url",
+            json={
+                "title": "Rejected probe",
+                "url": "https://media.example.com/rejected.mp4",
+                "probe_result": probe_result,
+            },
+        )
     assert response.status_code == 400
+    extract.assert_called_once()
     with app.app_context():
         assert db.session.scalar(select(func.count(MediaAsset.id))) == 0
 
@@ -731,7 +736,7 @@ def test_requests_reject_extra_fields_bad_probe_and_idempotency_key_reuse(
             "payload": {
                 "title": "Bad probe",
                 "url": "https://media.example.com/bad.mp4",
-                "probe_result": "unsupported_format",
+                "probe_result": "not-a-probe-result",
             },
             "client_request_id": "badprobe001",
         },

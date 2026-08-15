@@ -1,6 +1,6 @@
 # Group Theater (MovieSite)
 
-Synced watch-party rooms. Uploads go to **Mux** (transcoded HLS) so everyone gets the same playable stream. The uploader previews instantly from a local blob while Mux processes.
+Synced watch-party rooms with browser-local media and direct-link playback. New local videos are persisted in the adding browser with OPFS; their bytes are not uploaded to Flask, PostgreSQL, Railway, or Mux. Existing Mux playback remains supported as the cloud/fallback source architecture evolves.
 
 ## Railway setup
 
@@ -14,6 +14,7 @@ Synced watch-party rooms. Uploads go to **Mux** (transcoded HLS) so everyone get
    - `SOCKETIO_ALLOWED_ORIGINS` = optional comma-separated public origins; same-origin only by default
    - `RATELIMIT_STORAGE_URI` = optional shared rate-limit backend; the single-worker default uses memory
    - `DIRECT_URL_REQUIRE_HTTPS` = optional local override to force HTTPS; Railway requires HTTPS regardless
+  - yt-dlp is installed from `requirements.txt` and extracts playable media from pasted site links
 5. Redeploy. Railway runs `flask --app movie_theater.py db upgrade` before starting the app. Check `https://YOUR-APP.up.railway.app/api/mux/health` — it should return `{"ok": true}`.
 
 Do **not** use the Mux Data “environment key” (from the player/analytics setup screen). That is not an API access token.
@@ -34,16 +35,22 @@ python movie_theater.py
 
 The app falls back to SQLite when `DATABASE_URL` is omitted. PostgreSQL is required for deployment.
 
-Run tests with `pytest`. Set `TEST_POSTGRES_URL` to include the PostgreSQL integration test.
+Run backend tests with `pytest` and browser-storage module tests with
+`npm run test:js`. Set `TEST_POSTGRES_URL` to include the PostgreSQL integration
+test.
 
 ## Behavior
 
 - Register or sign in to create and join persistent rooms
 - Owned and joined rooms remain on the saved-room dashboard
-- File uploads go directly to Mux (not through Railway body limits) and are saved
-  to the room library before they are independently added to the queue
-- Privileged members can save browser-probed direct media URLs without the Flask
-  server fetching or proxying the submitted URL
+- Local videos are quota-checked, persisted in OPFS, registered as metadata-only
+  `BrowserLocalSource` records, and restored after refresh on the owning browser
+- Browser identity uses a durable random client token; only its SHA-256 digest is
+  stored in PostgreSQL, and local storage keys are disclosed only to that browser
+- Local files remain usable without Mux and are never sent through Railway
+- Privileged members can paste a YouTube or other site link; yt-dlp extracts a
+  playable clip, the room queues it, and the player starts it. Direct `.mp4`
+  files that this browser can play are still used as-is without a server fetch
 - Playback, queue, library, permissions, requests, and presence synchronize over
   authoritative Socket.IO room state
 - The backend stores reusable media separately from stable-ID queue entries

@@ -268,6 +268,10 @@ class DirectUrlSource(db.Model):
             "'unsupported_format', 'network_or_cors_failure', 'unavailable')",
             name="ck_direct_url_sources_probe_result",
         ),
+        CheckConstraint(
+            "extractor IN ('direct', 'yt_dlp')",
+            name="ck_direct_url_sources_extractor",
+        ),
     )
 
     source_id = db.Column(
@@ -277,6 +281,9 @@ class DirectUrlSource(db.Model):
     )
     original_url = db.Column(db.Text, nullable=False)
     normalized_url = db.Column(db.Text, nullable=False)
+    extractor = db.Column(
+        db.String(32), nullable=False, default="direct", server_default="direct"
+    )
     observed_content_type = db.Column(db.String(127))
     probe_result = db.Column(
         db.String(32), nullable=False, default="not_probed", server_default="not_probed"

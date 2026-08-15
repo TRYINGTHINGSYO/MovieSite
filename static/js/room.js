@@ -1,10 +1,20 @@
-/* Group Theater Stage 2B room client. */
+/* Group Theater Stage 2C-A room client. */
+
+import {
+  createDefaultLocalMediaStore,
+  createStorageKey,
+  getOrCreateBrowserToken,
+  inspectStorageCapacity,
+  pendingRegistrationBelongsTo,
+  probeLocalVideo,
+} from "./local_media.js";
 
 (() => {
   "use strict";
 
   const code = document.body.dataset.code;
   if (!code) return;
+  const authenticated = document.body.dataset.authenticated === "true";
   const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
   const $ = (id) => document.getElementById(id);
   const player = $("player");
@@ -14,6 +24,9 @@
   const notice = $("room-notice");
   const localFiles = new Map();
   const pollTimers = new Map();
+  const localRestoreTasks = new Map();
+  const reportedAvailability = new Map();
+  let hlsPlayer = null;
   const permissions = [
     "CONTROL_PLAYBACK",
     "ADD_MEDIA",
@@ -28,6 +41,10 @@
   let activeSourceKey = null;
   let mediaElement = player;
   let stateReceivedAt = performance.now();
+  let browserToken = null;
+  let browserClientId = null;
+  let localMediaStore = null;
+  let localMediaReady = false;
   let state = {
     queue: [],
     library: [],
@@ -48,6 +65,7 @@
     transports: ["websocket", "polling"],
     reconnection: true,
     reconnectionAttempts: 10,
+    autoConnect: false,
   });
 
   function node(tag, className, text) {
@@ -86,6 +104,7 @@
     const headers = new Headers(options.headers || {});
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.method && options.method !== "GET") headers.set("X-CSRFToken", csrfToken);
+    if (browserToken) headers.set("X-Browser-Client-Token", browserToken);
     const response = await fetch(path, { ...options, headers });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
@@ -136,6 +155,72 @@
     return (item.sources || []).find((source) => source.status === "ready") || item.sources?.[0] || null;
   }
 
+  function localSourceFor(item) {
+    return (item?.sources || []).find((source) => (
+      source.source_type === "browser_local" && source.storage_key
+    )) || null;
+  }
+
+  function sourceStatusLabel(source) {
+    if (!source) return "SOURCE • UNAVAILABLE";
+    if (source.source_type !== "browser_local") {
+      return `${source.source_type || "source"} • ${source.status || "unknown"}`.toUpperCase();
+    }
+    if (source.availability === "AVAILABLE_THIS_BROWSER") return "LOCAL • READY";
+    if (source.availability === "LOCAL_DATA_MISSING") return "LOCAL • MISSING";
+    if (source.availability === "ERROR") return "LOCAL • ERROR";
+    return "LOCAL";
+  }
+
+  function rememberLocalFile(roomMediaId, file, storageKey) {
+    const previous = localFiles.get(roomMediaId);
+    if (previous?.url) URL.revokeObjectURL(previous.url);
+    localFiles.set(roomMediaId, {
+      file,
+      storageKey,
+      url: URL.createObjectURL(file),
+    });
+  }
+
+  async function reportLocalAvailability(source, available) {
+    if (!source?.source_id || !browserToken) return;
+    const reportKey = `${source.source_id}:${available}`;
+    if (reportedAvailability.get(source.source_id) === reportKey) return;
+    reportedAvailability.set(source.source_id, reportKey);
+    try {
+      await api(`/api/rooms/${code}/media/browser-local/${source.source_id}/availability`, {
+        method: "POST",
+        body: JSON.stringify({ available }),
+      });
+    } catch (error) {
+      reportedAvailability.delete(source.source_id);
+      throw error;
+    }
+  }
+
+  async function restoreLocalLibrary(items = state.library) {
+    if (!localMediaStore) return;
+    for (const item of items || []) {
+      const source = localSourceFor(item);
+      if (!source || localFiles.has(item.id) || localRestoreTasks.has(source.storage_key)) continue;
+      const task = (async () => {
+        const restored = await localMediaStore.restore(source.storage_key);
+        if (!restored.available) {
+          await reportLocalAvailability(source, false);
+          return;
+        }
+        rememberLocalFile(item.id, restored.file, source.storage_key);
+        if (source.availability === "LOCAL_DATA_MISSING" || source.status !== "ready") {
+          await reportLocalAvailability(source, true);
+        }
+        loadCurrent();
+      })().catch((error) => inform(error.message, "error")).finally(() => {
+        localRestoreTasks.delete(source.storage_key);
+      });
+      localRestoreTasks.set(source.storage_key, task);
+    }
+  }
+
   function currentItem() {
     return state.queue.find((item) => item.id === state.current_id) || null;
   }
@@ -158,8 +243,31 @@
     if (result?.catch) result.catch(() => { $("tap-to-play").hidden = false; });
   }
 
+  function looksLikeDirectMediaFile(url) {
+    try {
+      return /\.(mp4|m4v|webm|ogv|ogg|mov|mkv|m3u8|mpd)$/i.test(new URL(url).pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function isHlsUrl(url) {
+    try {
+      return /\.m3u8$/i.test(new URL(url, window.location.origin).pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  function detachHls() {
+    if (!hlsPlayer) return;
+    hlsPlayer.destroy();
+    hlsPlayer = null;
+  }
+
   function showNoMedia() {
     activeSourceKey = null;
+    detachHls();
     player.hidden = true;
     player.removeAttribute("src");
     player.load();
@@ -182,8 +290,13 @@
     dropZone.classList.add("has-video");
     $("tap-to-play").hidden = true;
 
+    if (local && source?.source_type === "browser_local") {
+      setPlayerMessage("Playing from persistent storage on this browser.");
+      attachHtmlVideo(local.url, `local:${item.id}`);
+      return;
+    }
     if (local && source?.status !== "ready") {
-      setPlayerMessage("Playing your local upload while Mux prepares the shared stream.");
+      setPlayerMessage("Playing your local copy while the shared source prepares.");
       attachHtmlVideo(local.url, `local:${item.id}`);
       return;
     }
@@ -195,6 +308,13 @@
     if (source?.source_type === "direct_url" && source.url) {
       setPlayerMessage(source.probe_result === "playable_no_seek" ? "This source may not support seeking." : "");
       attachHtmlVideo(source.url, `url:${source.source_id}`);
+      return;
+    }
+    if (source?.source_type === "browser_local") {
+      const message = source.availability === "LOCAL_DATA_MISSING"
+        ? "The owning browser can no longer find this local video."
+        : "This video is stored on its source owner's browser.";
+      setPlayerMessage(message, source.availability === "LOCAL_DATA_MISSING");
       return;
     }
     if (source?.status === "error" || source?.status === "unavailable") {
@@ -213,8 +333,16 @@
     mediaElement = player;
     applyingRemote = true;
     if (changed) {
-      player.src = url;
-      player.load();
+      detachHls();
+      if (isHlsUrl(url) && window.Hls?.isSupported()) {
+        player.removeAttribute("src");
+        hlsPlayer = new window.Hls();
+        hlsPlayer.loadSource(url);
+        hlsPlayer.attachMedia(player);
+      } else {
+        player.src = url;
+        player.load();
+      }
     }
     const targetPosition = authoritativePosition();
     if (Math.abs((player.currentTime || 0) - targetPosition) > 0.75) {
@@ -228,6 +356,7 @@
     const key = `mux:${playbackId}`;
     const changed = activeSourceKey !== key;
     activeSourceKey = key;
+    detachHls();
     player.hidden = true;
     muxPlayer.hidden = false;
     mediaElement = muxPlayer;
@@ -252,7 +381,7 @@
       const summary = node("div", "resource-summary");
       summary.append(node("strong", "resource-title", item.name));
       const source = sourceFor(item);
-      summary.append(node("span", "resource-meta", `${source?.source_type || "source"} · ${source?.status || "unknown"}`));
+      summary.append(node("span", "resource-meta", sourceStatusLabel(source)));
       row.append(summary);
       const actions = node("div", "resource-actions");
       const label = can("MANAGE_QUEUE") ? "Add to queue" : "Request queue";
@@ -385,14 +514,17 @@
     muxPlayer.toggleAttribute("controls", controlsPlayback);
     $("viewer-count").textContent = String(state.viewer_count || 0);
     $("playback-mode").textContent = controlsPlayback ? "You control playback" : "Actions send requests";
-    $("upload-media").hidden = !can("ADD_MEDIA");
-    $("direct-submit").textContent = can("ADD_MEDIA") ? "Probe & save" : "Probe & request";
+    $("add-local-media").hidden = !can("ADD_MEDIA") || !authenticated || !localMediaReady;
+    $("direct-submit").textContent = can("ADD_MEDIA")
+      ? (can("MANAGE_QUEUE") ? "Play link" : "Add link")
+      : "Request link";
     renderLibrary();
     renderQueue();
     renderPeople();
     renderRequests();
     loadCurrent();
     ensureMuxPolling();
+    void restoreLocalLibrary(state.library);
   }
 
   async function probeDirectUrl(url) {
@@ -426,63 +558,111 @@
 
   $("direct-url-form").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const title = $("direct-title").value.trim() || "Direct media";
+    const title = $("direct-title").value.trim();
     const url = $("direct-url").value.trim();
-    $("probe-result").textContent = "Probing in this browser…";
+    const enqueue = can("MANAGE_QUEUE");
     try {
-      const probeResult = await probeDirectUrl(url);
-      $("probe-result").textContent = probeResult.replaceAll("_", " ");
-      if (!["playable", "playable_no_seek"].includes(probeResult)) {
-        throw new Error("This URL did not pass the browser playback probe and was not saved.");
+      let probeResult = "not_probed";
+      if (looksLikeDirectMediaFile(url)) {
+        $("probe-result").textContent = "Checking this browser…";
+        probeResult = await probeDirectUrl(url);
+        $("probe-result").textContent = probeResult.replaceAll("_", " ");
+      } else {
+        $("probe-result").textContent = "Extracting a playable clip…";
       }
+      const payload = { url, probe_result: probeResult, enqueue };
+      if (title) payload.title = title;
       if (can("ADD_MEDIA")) {
         await api(`/api/rooms/${code}/media/direct-url`, {
           method: "POST",
-          body: JSON.stringify({ title, url, probe_result: probeResult }),
+          body: JSON.stringify(payload),
         });
-        inform("Direct media saved. Add it to the queue when ready.");
+        inform(enqueue ? "Playing that link for the room." : "Link saved. Add it to the queue when ready.");
       } else {
-        await submitRequest("ADD_DIRECT_URL", { title, url, probe_result: probeResult });
+        await submitRequest("ADD_DIRECT_URL", {
+          title: title || "Clip",
+          url,
+          probe_result: probeResult,
+        });
       }
       $("direct-url-form").reset();
+      $("probe-result").textContent = "";
     } catch (error) {
       inform(error.message, "error");
     }
   });
 
-  $("upload-media").addEventListener("click", () => $("file-input").click());
+  $("add-local-media").addEventListener("click", () => $("file-input").click());
   $("file-input").addEventListener("change", () => {
     const files = [...($("file-input").files || [])];
     $("file-input").value = "";
-    files.reduce((chain, file) => chain.then(() => uploadMux(file)), Promise.resolve())
+    files.reduce((chain, file) => chain.then(() => addLocalFile(file)), Promise.resolve())
       .catch((error) => inform(error.message, "error"));
   });
 
-  async function uploadMux(file) {
-    $("upload-progress").hidden = false;
-    $("upload-label").textContent = `Preparing ${file.name}…`;
-    const created = await api(`/api/mux/create-upload/${code}`, {
+  async function registerPersistedLocal(record) {
+    const result = await api(`/api/rooms/${code}/media/browser-local`, {
       method: "POST",
-      body: JSON.stringify({ filename: file.name, size: file.size, save_only: true }),
+      body: JSON.stringify({
+        storage_key: record.storage_key,
+        original_filename: record.original_filename,
+        mime_type: record.mime_type,
+        byte_size: record.byte_size,
+        duration: record.duration,
+      }),
     });
-    const localUrl = URL.createObjectURL(file);
-    localFiles.set(created.room_media_id, { file, url: localUrl });
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("PUT", created.upload_url);
-      xhr.upload.onprogress = (event) => {
-        if (!event.lengthComputable) return;
-        const percentage = Math.round((event.loaded / event.total) * 100);
-        $("upload-fill").style.width = `${percentage}%`;
-        $("upload-label").textContent = `Uploading ${file.name}… ${percentage}%`;
-      };
-      xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Mux upload failed (${xhr.status})`));
-      xhr.onerror = () => reject(new Error("Network error while uploading to Mux"));
-      xhr.send(file);
+    await localMediaStore.markRegistered(record.storage_key, {
+      browser_client_id: result.browser_client_id,
+      media_asset_id: result.media_asset_id,
+      room_media_id: result.room_media_id,
+      source_id: result.source_id,
     });
-    await api(`/api/mux/uploaded/${code}/${created.video_id}`, { method: "POST" });
-    $("upload-progress").hidden = true;
-    pollMux(created.video_id);
+    return result;
+  }
+
+  async function addLocalFile(file) {
+    if (!localMediaStore || !browserToken || !browserClientId) {
+      throw new Error("Persistent local media is not ready in this browser.");
+    }
+    $("upload-progress").hidden = false;
+    $("upload-fill").style.width = "0%";
+    try {
+      $("upload-label").textContent = `Checking storage for ${file.name}...`;
+      await inspectStorageCapacity(file.size, localMediaStore.storageManager);
+      $("upload-label").textContent = `Inspecting ${file.name}...`;
+      const probe = await probeLocalVideo(file);
+      const storageKey = createStorageKey();
+      $("upload-label").textContent = `Saving ${file.name} on this browser...`;
+      const persisted = await localMediaStore.persist(file, {
+        storage_key: storageKey,
+        browser_client_id: browserClientId,
+        room_code: code,
+        original_filename: file.name,
+        mime_type: file.type || "application/octet-stream",
+        duration: probe.duration,
+      });
+      let result;
+      $("upload-label").textContent = `Registering ${file.name}...`;
+      try {
+        result = await registerPersistedLocal(persisted.record);
+      } catch (error) {
+        if ([400, 413, 422].includes(error.status)) {
+          await localMediaStore.remove(storageKey);
+        } else {
+          inform("The video is saved locally; registration will retry after reconnect.", "error");
+        }
+        throw error;
+      }
+      rememberLocalFile(result.room_media_id, file, storageKey);
+      if (!persisted.capacity.persistent) {
+        inform("Video saved locally. This browser did not guarantee persistent storage.");
+      } else {
+        inform("Video saved on this browser. Add it to the queue when ready.");
+      }
+      if (result.state) applyState(result.state);
+    } finally {
+      $("upload-progress").hidden = true;
+    }
   }
 
   function pollMux(entryId) {
@@ -521,6 +701,54 @@
       const source = sourceFor(item);
       if (source?.source_type === "mux_upload" && ["uploading", "processing"].includes(source.status)) pollMux(item.id);
     }
+  }
+
+  async function retryPendingLocalRegistrations() {
+    if (!localMediaStore) return;
+    const records = await localMediaStore.list();
+    for (const record of records) {
+      if (!pendingRegistrationBelongsTo(record, code, browserClientId)) continue;
+      const restored = await localMediaStore.restore(record.storage_key);
+      if (!restored.available) {
+        await localMediaStore.remove(record.storage_key);
+        continue;
+      }
+      try {
+        const result = await registerPersistedLocal(record);
+        rememberLocalFile(result.room_media_id, restored.file, record.storage_key);
+      } catch (error) {
+        if ([400, 413, 422].includes(error.status)) {
+          await localMediaStore.remove(record.storage_key);
+        }
+      }
+    }
+  }
+
+  async function initializeBrowserLocalMedia() {
+    if (!authenticated) {
+      socket.connect();
+      return;
+    }
+    try {
+      browserToken = getOrCreateBrowserToken();
+      localMediaStore = createDefaultLocalMediaStore();
+      const registration = await api("/api/browser-clients/register", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      browserClientId = registration.browser_client_id;
+      localMediaReady = true;
+      socket.auth = { browser_client_token: browserToken };
+      socket.connect();
+      void retryPendingLocalRegistrations().catch((error) => inform(error.message, "error"));
+      return;
+    } catch (error) {
+      browserClientId = null;
+      localMediaStore = null;
+      localMediaReady = false;
+      inform(`Local video storage is unavailable: ${error.message}`, "error");
+    }
+    socket.connect();
   }
 
   $("clear-upcoming").addEventListener("click", () => {
@@ -588,4 +816,6 @@
     for (const timer of pollTimers.values()) window.clearInterval(timer);
     for (const local of localFiles.values()) URL.revokeObjectURL(local.url);
   });
+
+  void initializeBrowserLocalMedia();
 })();

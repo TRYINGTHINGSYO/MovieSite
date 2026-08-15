@@ -60,10 +60,16 @@ class Actor:
         return "anonymous"
 
 
-def actor_for_user(user: User | object) -> Actor:
+def actor_for_user(
+    user: User | object, browser_client_id: str | None = None
+) -> Actor:
     if not getattr(user, "is_authenticated", False):
         return Actor(kind="anonymous")
-    return Actor(kind="user", user_id=int(getattr(user, "id")))
+    return Actor(
+        kind="user",
+        user_id=int(getattr(user, "id")),
+        browser_client_id=browser_client_id,
+    )
 
 
 def actor_for_guest(guest_id: str, browser_client_id: str | None = None) -> Actor:

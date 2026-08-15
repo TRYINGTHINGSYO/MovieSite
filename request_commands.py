@@ -13,7 +13,13 @@ from authorization import (
     lock_room_for,
     permissions_for,
 )
-from direct_urls import require_playable_probe, validate_direct_url
+from direct_urls import (
+    DirectUrlError,
+    PLAYABLE_PROBE_RESULTS,
+    validate_direct_url,
+    validate_probe_result,
+)
+from link_extract import EXTRACTOR_DIRECT, EXTRACTOR_YT_DLP, extract_clip
 from models import QueueEntry, RoomMedia, RoomRequest, WatchRoom, db
 from room_commands import (
     CommandError,
@@ -268,12 +274,17 @@ def validate_request_payload(
             raise ResourceNotFoundError("Saved media not found in this room")
         return {"room_media_id": room_media_id}
     if request_type == "ADD_DIRECT_URL":
-        _require_keys(body, {"title", "url", "probe_result"})
+        allowed = {"title", "url"}
+        if "probe_result" in body:
+            allowed.add("probe_result")
+        _require_keys(body, allowed)
+        if "url" not in body:
+            raise RequestValidationError("An absolute media URL is required")
         try:
             validated = validate_direct_url(
                 body.get("url"), require_https=require_https
             )
-            probe_result = require_playable_probe(body.get("probe_result"))
+            probe_result = validate_probe_result(body.get("probe_result"))
         except ValueError as exc:
             raise RequestValidationError(str(exc)) from exc
         title = _media_title(body.get("title"))
@@ -361,14 +372,35 @@ def _execute_approved_request(
         )
         return
     if request_type == "ADD_DIRECT_URL":
-        validated = validate_direct_url(payload["url"], require_https=require_https)
-        create_direct_media(
-            room.id,
-            actor,
-            payload["title"],
-            validated,
-            probe_result=payload.get("probe_result", "not_probed"),
-        )
+        try:
+            validated = validate_direct_url(payload["url"], require_https=require_https)
+            probe_result = validate_probe_result(payload.get("probe_result"))
+            extractor = EXTRACTOR_DIRECT
+            duration = None
+            observed_content_type = None
+            title = payload["title"]
+            if probe_result not in PLAYABLE_PROBE_RESULTS:
+                extracted = extract_clip(
+                    validated.normalized, require_https=require_https
+                )
+                probe_result = "playable"
+                extractor = EXTRACTOR_YT_DLP
+                duration = extracted.duration
+                observed_content_type = extracted.content_type
+                if title in {None, "", "Direct media"}:
+                    title = extracted.title
+            create_direct_media(
+                room.id,
+                actor,
+                title,
+                validated,
+                probe_result=probe_result,
+                extractor=extractor,
+                duration=duration,
+                observed_content_type=observed_content_type,
+            )
+        except DirectUrlError as exc:
+            raise RequestValidationError(str(exc)) from exc
         return
     raise RequestValidationError("Unsupported request type")
 

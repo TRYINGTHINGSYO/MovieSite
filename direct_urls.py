@@ -7,6 +7,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 
 MAX_DIRECT_URL_LENGTH = 4096
+MAX_EXTRACTED_URL_LENGTH = 16384
 BLOCKED_SCHEMES = frozenset({"javascript", "data", "file", "ftp", "gopher"})
 ALLOWED_PROBE_RESULTS = frozenset(
     {
@@ -32,10 +33,15 @@ class ValidatedDirectUrl:
     normalized: str
 
 
-def validate_direct_url(value: object, *, require_https: bool) -> ValidatedDirectUrl:
+def validate_direct_url(
+    value: object,
+    *,
+    require_https: bool,
+    max_length: int = MAX_DIRECT_URL_LENGTH,
+) -> ValidatedDirectUrl:
     if not isinstance(value, str):
         raise DirectUrlError("Media URL must be a string")
-    if len(value) > MAX_DIRECT_URL_LENGTH:
+    if len(value) > max_length:
         raise DirectUrlError("Media URL is too long")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise DirectUrlError("Media URL contains control characters")

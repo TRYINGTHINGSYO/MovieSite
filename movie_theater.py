@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from urllib.parse import urljoin, urlparse
 
 import requests
-from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask import Flask, Response, flash, redirect, render_template, request, session, stream_with_context, url_for
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_login import (
@@ -45,9 +45,30 @@ from authorization import (
     require_permission,
     revoke_permission,
 )
-from direct_urls import DirectUrlError, require_playable_probe, validate_direct_url
+from browser_local import (
+    BrowserClientProofError,
+    BrowserLocalConflictError,
+    create_browser_local_media,
+    prove_browser_client,
+    register_browser_client,
+    update_browser_local_availability,
+)
+from direct_urls import (
+    DirectUrlError,
+    PLAYABLE_PROBE_RESULTS,
+    validate_direct_url,
+    validate_probe_result,
+)
+from link_extract import (
+    EXTRACTOR_DIRECT,
+    EXTRACTOR_YT_DLP,
+    extract_clip,
+    forwarded_stream_headers,
+    open_media_stream,
+)
 from media_sources import queue_entry_to_public, room_media_to_public
 from models import (
+    BrowserClient,
     MediaSource,
     MuxMediaSource,
     QueueEntry,
@@ -177,6 +198,7 @@ CODE_LEN = 8
 sid_to_code: dict[str, str] = {}
 sid_to_user: dict[str, int] = {}
 sid_to_guest: dict[str, str] = {}
+sid_to_browser_client: dict[str, str] = {}
 sid_to_presence: dict[str, dict] = {}
 identity_join_failures: dict[str, list[float]] = {}
 user_to_sids: dict[int, set[str]] = {}
@@ -242,7 +264,14 @@ def ensure_guest_id() -> str:
 
 def current_actor(*, create_guest: bool = True) -> Actor:
     if current_user.is_authenticated:
-        return actor_for_user(current_user)
+        browser_client_id = None
+        token = request.headers.get("X-Browser-Client-Token")
+        if token:
+            try:
+                browser_client_id = prove_browser_client(current_user.id, token).id
+            except BrowserClientProofError:
+                pass
+        return actor_for_user(current_user, browser_client_id)
     guest_id = ensure_guest_id() if create_guest else session.get("guest_id")
     if not guest_id:
         return Actor(kind="anonymous")
@@ -284,9 +313,16 @@ def public_state(room: WatchRoom, actor: Actor | None = None) -> dict:
     capabilities = permissions_for(room, actor)
     requests_for_actor = visible_requests(room, actor)
     return {
-        "queue": [queue_entry_to_public(entry) for entry in entries],
+        "queue": [
+            queue_entry_to_public(
+                entry, browser_client_id=actor.browser_client_id
+            )
+            for entry in entries
+        ],
         "library": [
-            room_media_to_public(room_media)
+            room_media_to_public(
+                room_media, browser_client_id=actor.browser_client_id
+            )
             for room_media in room.library_items
             if room_media.asset.deleted_at is None
         ],
@@ -349,7 +385,11 @@ def room_presence(code: str) -> list[dict]:
 def actor_for_sid(sid: str) -> Actor:
     user_id = sid_to_user.get(sid)
     if user_id is not None:
-        return Actor(kind="user", user_id=user_id)
+        return Actor(
+            kind="user",
+            user_id=user_id,
+            browser_client_id=sid_to_browser_client.get(sid),
+        )
     guest_id = sid_to_guest.get(sid)
     if guest_id:
         return actor_for_guest(guest_id)
@@ -692,6 +732,8 @@ def api_command_error(exc: Exception, room: WatchRoom | None = None):
         return payload, 409
     if isinstance(exc, RequestConflictError):
         return {"error": str(exc)}, 409
+    if isinstance(exc, BrowserLocalConflictError):
+        return {"error": str(exc)}, 409
     if isinstance(exc, ResourceNotFoundError):
         return {"error": str(exc)}, 404
     if isinstance(exc, (RequestValidationError, DirectUrlError, CommandError)):
@@ -703,6 +745,33 @@ def api_command_error(exc: Exception, room: WatchRoom | None = None):
     raise exc
 
 
+def required_browser_client() -> BrowserClient:
+    if not current_user.is_authenticated:
+        raise BrowserClientProofError("Authentication is required")
+    return prove_browser_client(
+        current_user.id,
+        request.headers.get("X-Browser-Client-Token"),
+    )
+
+
+@app.route("/api/browser-clients/register", methods=["POST"])
+@login_required
+@limiter.limit("30 per hour", key_func=rate_limit_key)
+def register_current_browser_client():
+    try:
+        body = json_object_body()
+        if body:
+            raise CommandError("Browser registration does not accept metadata")
+        browser_client = register_browser_client(
+            current_user.id,
+            request.headers.get("X-Browser-Client-Token"),
+        )
+        db.session.commit()
+    except (AuthorizationError, CommandError) as exc:
+        return api_command_error(exc)
+    return {"ok": True, "browser_client_id": browser_client.id}
+
+
 @app.route("/api/rooms/<code>/state", methods=["GET"])
 @limiter.limit("120 per hour")
 def room_state_api(code: str):
@@ -710,6 +779,89 @@ def room_state_api(code: str):
     if not can_view_room(room, current_actor()):
         return {"error": "Room not found or inactive"}, 404
     return {"state": public_state(room)}
+
+
+@app.route("/api/rooms/<code>/media/browser-local", methods=["POST"])
+@login_required
+@limiter.limit("20 per hour", key_func=rate_limit_key)
+def create_local_media(code: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        browser_client = required_browser_client()
+        actor = actor_for_user(current_user, browser_client.id)
+        body = json_object_body()
+        allowed_fields = {
+            "storage_key",
+            "original_filename",
+            "mime_type",
+            "byte_size",
+            "duration",
+        }
+        if set(body) - allowed_fields:
+            raise CommandError("Unexpected browser-local media metadata")
+        room, room_media, source, _local_source, created = (
+            create_browser_local_media(
+                room.id,
+                actor,
+                browser_client,
+                storage_key=body.get("storage_key"),
+                original_filename=body.get("original_filename"),
+                mime_type=body.get("mime_type"),
+                byte_size=body.get("byte_size"),
+                duration=body.get("duration"),
+            )
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    room = db.session.get(WatchRoom, room.id)
+    broadcast_room_updates(room, "library:updated", "room:state")
+    return {
+        "ok": True,
+        "created": created,
+        "browser_client_id": browser_client.id,
+        "media_asset_id": source.media_asset_id,
+        "room_media_id": room_media.id,
+        "source_id": source.id,
+        "state": public_state(room, actor),
+    }, 201 if created else 200
+
+
+@app.route(
+    "/api/rooms/<code>/media/browser-local/<source_id>/availability",
+    methods=["POST"],
+)
+@login_required
+@limiter.limit("60 per hour", key_func=rate_limit_key)
+def update_local_media_availability(code: str, source_id: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        browser_client = required_browser_client()
+        actor = actor_for_user(current_user, browser_client.id)
+        body = json_object_body()
+        if set(body) != {"available"}:
+            raise CommandError("Availability requires exactly one boolean field")
+        room, source, _local_source = update_browser_local_availability(
+            room.id,
+            actor,
+            browser_client,
+            stable_id(source_id, "browser-local source"),
+            available=body.get("available"),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    room = db.session.get(WatchRoom, room.id)
+    broadcast_room_updates(room, "library:updated", "room:state")
+    return {
+        "ok": True,
+        "source_id": source.id,
+        "state": public_state(room, actor),
+    }
 
 
 @app.route("/api/rooms/<code>/media/direct-url", methods=["POST"])
@@ -722,28 +874,139 @@ def create_direct_url_media(code: str):
         actor = current_actor()
         require_permission(room, actor, Permission.ADD_MEDIA)
         body = json_object_body()
+        allowed_fields = {"title", "url", "probe_result", "enqueue"}
+        if set(body) - allowed_fields:
+            raise CommandError("Unexpected direct media field")
+        enqueue_value = body.get("enqueue")
+        if enqueue_value is None:
+            enqueue = False
+        elif isinstance(enqueue_value, bool):
+            enqueue = enqueue_value
+        else:
+            raise CommandError("enqueue must be a boolean")
+        capabilities = permissions_for(room, actor)
+        enqueue = enqueue and Permission.MANAGE_QUEUE in capabilities
+        play_now = enqueue and Permission.CONTROL_PLAYBACK in capabilities
         validated = validate_direct_url(
             body.get("url"),
             require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
         )
-        probe_result = require_playable_probe(body.get("probe_result"))
+        probe_result = validate_probe_result(body.get("probe_result"))
+        extracted = None
+        extractor = EXTRACTOR_DIRECT
+        if probe_result not in PLAYABLE_PROBE_RESULTS:
+            extracted = extract_clip(
+                validated.normalized,
+                require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+            )
+            probe_result = "playable"
+            extractor = EXTRACTOR_YT_DLP
+        raw_title = body.get("title")
+        if raw_title in (None, "") and extracted is not None:
+            title = extracted.title
+        else:
+            title = media_title(raw_title)
         room, room_media, _source, _direct = create_direct_media(
             room.id,
             actor,
-            media_title(body.get("title")),
+            title,
             validated,
             probe_result=probe_result,
+            extractor=extractor,
+            duration=extracted.duration if extracted is not None else None,
+            observed_content_type=(
+                extracted.content_type if extracted is not None else None
+            ),
+            enqueue=enqueue,
+            play_now=play_now,
         )
         db.session.commit()
-    except (AuthorizationError, RoomUnavailableError, DirectUrlError, CommandError) as exc:
+    except (
+        AuthorizationError,
+        RoomUnavailableError,
+        DirectUrlError,
+        CommandError,
+    ) as exc:
         return api_command_error(exc, room)
     room = db.session.get(WatchRoom, room.id)
-    broadcast_room_updates(room, "library:updated", "room:state")
+    events = ["library:updated", "room:state"]
+    if enqueue:
+        events.extend(["queue:updated", "queue_updated", "playback:updated"])
+    broadcast_room_updates(room, *events)
     return {
         "ok": True,
         "room_media_id": room_media.id,
         "state": public_state(room),
     }, 201
+
+
+@app.route("/api/media/sources/<source_id>/stream", methods=["GET", "HEAD"])
+def stream_extracted_source(source_id: str):
+    try:
+        source_key = stable_id(source_id, "media source")
+    except CommandError as exc:
+        return api_command_error(exc)
+    source = db.session.get(MediaSource, source_key)
+    direct = source.direct_url if source is not None else None
+    if (
+        source is None
+        or source.deleted_at is not None
+        or source.source_type != "direct_url"
+        or direct is None
+        or direct.extractor != EXTRACTOR_YT_DLP
+    ):
+        return {"error": "Media source not found"}, 404
+    room = db.session.scalar(
+        select(WatchRoom)
+        .join(RoomMedia, RoomMedia.room_id == WatchRoom.id)
+        .where(RoomMedia.media_asset_id == source.media_asset_id)
+        .order_by(RoomMedia.created_at, RoomMedia.id)
+    )
+    actor = current_actor()
+    if (
+        not can_view_room(room, actor)
+        or (source.asset is not None and source.asset.deleted_at is not None)
+    ):
+        return {"error": "Media source not found"}, 404
+    try:
+        extracted = extract_clip(
+            direct.original_url,
+            require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+        )
+        if request.method == "HEAD":
+            upstream = open_media_stream(
+                extracted.playback_url,
+                headers=extracted.http_headers,
+                range_header=request.headers.get("Range"),
+                require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+            )
+            headers = forwarded_stream_headers(upstream)
+            status = upstream.status_code
+            upstream.close()
+            return Response(status=status, headers=headers)
+        upstream = open_media_stream(
+            extracted.playback_url,
+            headers=extracted.http_headers,
+            range_header=request.headers.get("Range"),
+            require_https=app.config["DIRECT_URL_REQUIRE_HTTPS"],
+        )
+    except DirectUrlError as exc:
+        return api_command_error(exc, room)
+
+    def generate():
+        try:
+            for chunk in upstream.iter_content(256 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            upstream.close()
+
+    return Response(
+        stream_with_context(generate()),
+        status=upstream.status_code,
+        headers=forwarded_stream_headers(upstream),
+        direct_passthrough=True,
+    )
 
 
 @app.route("/api/rooms/<code>/queue", methods=["POST"])
@@ -1263,11 +1526,18 @@ def authorized_socket_room(data) -> WatchRoom | None:
 
 
 @socketio.on("connect")
-def on_connect():
+def on_connect(auth=None):
     actor = current_actor(create_guest=False)
     if not (actor.is_user or actor.is_guest):
         return False
     if actor.is_user:
+        token = auth.get("browser_client_token") if isinstance(auth, dict) else None
+        if token:
+            try:
+                browser_client = prove_browser_client(actor.user_id, token)
+            except BrowserClientProofError:
+                return False
+            sid_to_browser_client[request.sid] = browser_client.id
         sid_to_user[request.sid] = actor.user_id
         user_to_sids.setdefault(actor.user_id, set()).add(request.sid)
     else:
@@ -1320,6 +1590,7 @@ def on_disconnect():
     revoked_sids.discard(request.sid)
     user_id = sid_to_user.pop(request.sid, None)
     sid_to_guest.pop(request.sid, None)
+    sid_to_browser_client.pop(request.sid, None)
     sid_to_presence.pop(request.sid, None)
     if user_id is not None:
         sids = user_to_sids.get(user_id)

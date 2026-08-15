@@ -143,15 +143,26 @@ def create_direct_media(
     validated_url: ValidatedDirectUrl,
     *,
     probe_result: str = "not_probed",
+    extractor: str = "direct",
+    duration: float | None = None,
+    observed_content_type: str | None = None,
+    enqueue: bool = False,
+    play_now: bool = False,
     asset_id: str | None = None,
     source_id: str | None = None,
     room_media_id: str | None = None,
+    queue_entry_id: str | None = None,
 ) -> tuple[WatchRoom, RoomMedia, MediaSource, DirectUrlSource]:
     room = lock_room_for(room_id, actor, Permission.ADD_MEDIA)
+    if enqueue:
+        require_permission(room, actor, Permission.MANAGE_QUEUE)
+    if play_now:
+        require_permission(room, actor, Permission.CONTROL_PLAYBACK)
     clean_title = str(title or "").strip()[:255] or "Direct media"
     asset = MediaAsset(
         id=asset_id or new_id(),
         title=clean_title,
+        duration=duration,
         created_by_id=actor.user_id,
     )
     source = MediaSource(
@@ -159,12 +170,15 @@ def create_direct_media(
         asset=asset,
         source_type="direct_url",
         status="ready" if probe_result in {"playable", "playable_no_seek"} else "unverified",
+        mime_type=observed_content_type,
         error=None if probe_result in {"playable", "playable_no_seek"} else probe_result,
     )
     direct = DirectUrlSource(
         source=source,
         original_url=validated_url.original,
         normalized_url=validated_url.normalized,
+        extractor=extractor,
+        observed_content_type=observed_content_type,
         probe_result=probe_result,
         last_probed_at=(
             datetime.now(UTC) if probe_result != "not_probed" else None
@@ -177,7 +191,33 @@ def create_direct_media(
         added_by_id=actor.user_id,
     )
     db.session.add_all([asset, source, direct, room_media])
+    entry = None
+    if enqueue:
+        next_position = (
+            db.session.scalar(
+                select(func.coalesce(func.max(QueueEntry.position), -1)).where(
+                    QueueEntry.room_id == room.id
+                )
+            )
+            + 1
+        )
+        entry = QueueEntry(
+            id=queue_entry_id or new_id(),
+            room_id=room.id,
+            room_media=room_media,
+            position=next_position,
+            added_by_id=actor.user_id,
+        )
+        db.session.add(entry)
     db.session.flush()
+    if entry is not None:
+        room.queue_version += 1
+        if play_now or room.current_queue_entry_id is None:
+            room.current_queue_entry_id = entry.id
+            room.playing = bool(play_now)
+            room.position = 0.0
+            room.playback_updated_at = datetime.now(UTC)
+            room.playback_version += 1
     return room, room_media, source, direct
 
 

@@ -5,6 +5,8 @@ from typing import Protocol
 
 from models import MediaAsset, MediaSource, QueueEntry
 
+from link_extract import EXTRACTOR_YT_DLP
+
 
 MUX_UPLOAD = "mux_upload"
 DIRECT_URL = "direct_url"
@@ -50,13 +52,17 @@ class DirectUrlSourceAdapter:
         self, source: MediaSource, *, browser_client_id: str | None = None
     ) -> dict:
         direct = source.direct_url
+        playback_url = direct.normalized_url if direct else None
+        if direct and direct.extractor == EXTRACTOR_YT_DLP:
+            playback_url = f"/api/media/sources/{source.id}/stream"
         return {
             "source_id": source.id,
             "source_type": self.source_type,
             "status": source.status,
-            "url": direct.normalized_url if direct else None,
+            "url": playback_url,
             "error": source.error,
             "probe_result": direct.probe_result if direct else "not_probed",
+            "extractor": direct.extractor if direct else "direct",
             "availability": (
                 "remote"
                 if source.status == "ready"
@@ -78,13 +84,21 @@ class BrowserLocalSourceAdapter:
             and browser_client_id
             and local.browser_client_id == browser_client_id
         )
+        if source.status == "missing":
+            availability = "LOCAL_DATA_MISSING"
+        elif source.status == "error":
+            availability = "ERROR"
+        elif owns_source and source.status == "ready":
+            availability = "AVAILABLE_THIS_BROWSER"
+        else:
+            availability = "LOCAL_OWNER_OFFLINE"
         payload = {
             "source_id": source.id,
             "source_type": self.source_type,
             "status": source.status,
             "url": None,
             "error": source.error,
-            "availability": "available_on_this_browser" if owns_source else "local_only",
+            "availability": availability,
         }
         if owns_source:
             payload["storage_key"] = local.storage_key

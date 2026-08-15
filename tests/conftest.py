@@ -12,6 +12,7 @@ from movie_theater import (
     identity_join_failures,
     limiter,
     revoked_sids,
+    sid_to_browser_client,
     sid_to_code,
     sid_to_guest,
     sid_to_presence,
@@ -45,6 +46,7 @@ def app():
         db.create_all()
     limiter.reset()
     sid_to_code.clear()
+    sid_to_browser_client.clear()
     sid_to_guest.clear()
     identity_join_failures.clear()
     sid_to_presence.clear()

@@ -397,8 +397,9 @@ def test_source_abstraction_hides_browser_storage_key_from_other_browsers(
             local_source, browser_client_id=browser.id
         )
         assert "storage_key" not in public_for_other
-        assert public_for_other["availability"] == "local_only"
+        assert public_for_other["availability"] == "LOCAL_OWNER_OFFLINE"
         assert public_for_owner["storage_key"] == "opfs/mixed-media"
+        assert public_for_owner["availability"] == "AVAILABLE_THIS_BROWSER"
         assert room_media_to_public(room_media)["sources"][0]["source_type"] in {
             "direct_url",
             "browser_local",
