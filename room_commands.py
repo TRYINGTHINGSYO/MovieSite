@@ -281,14 +281,7 @@ def reorder_queue(
     if set(ordered_entry_ids) != set(current_ids):
         raise VersionConflictError("Queue contents changed before reorder")
 
-    by_id = {entry.id: entry for entry in entries}
-    temporary_offset = max([entry.position for entry in entries], default=-1) + len(entries) + 1
-    for entry in entries:
-        entry.position += temporary_offset
-    db.session.flush()
-    for position, entry_id in enumerate(ordered_entry_ids):
-        by_id[entry_id].position = position
-    db.session.flush()
+    _apply_queue_order(entries, ordered_entry_ids)
     room.queue_version += 1
     return room
 
@@ -346,7 +339,7 @@ def select_queue_entry(
     if entry is None:
         raise ResourceNotFoundError("Queue entry not found")
     room.current_queue_entry_id = entry.id
-    room.playing = False
+    room.playing = True
     room.position = 0.0
     room.playback_updated_at = datetime.now(UTC)
     room.playback_version += 1
@@ -381,6 +374,61 @@ def update_playback(
     room.position = position
     room.playback_updated_at = datetime.now(UTC)
     room.playback_version += 1
+    return room
+
+
+def defer_queue_entry(
+    room_id: int,
+    actor: Actor,
+    entry_id: str,
+    *,
+    expected_queue_version: int | None = None,
+) -> WatchRoom:
+    room = lock_room_for(room_id, actor, Permission.MANAGE_QUEUE)
+    _check_version(room.queue_version, expected_queue_version, "queue")
+    entries = queue_entries_for(room.id)
+    entry = next((item for item in entries if item.id == entry_id), None)
+    if entry is None:
+        raise ResourceNotFoundError("Queue entry not found")
+    was_current = room.current_queue_entry_id == entry.id
+    if was_current:
+        require_permission(room, actor, Permission.CONTROL_PLAYBACK)
+    ordered_ids = [item.id for item in entries if item.id != entry_id] + [entry_id]
+    _apply_queue_order(entries, ordered_ids)
+    room.queue_version += 1
+    if was_current:
+        remaining = [item for item in entries if item.id != entry_id]
+        original_index = next(
+            (index for index, item in enumerate(entries) if item.id == entry_id),
+            0,
+        )
+        if remaining:
+            next_entry = (
+                remaining[original_index]
+                if original_index < len(remaining)
+                else remaining[0]
+            )
+            room.current_queue_entry_id = next_entry.id
+            room.playing = True
+            room.position = 0.0
+            room.playback_updated_at = datetime.now(UTC)
+            room.playback_version += 1
+    db.session.flush()
+    return room
+
+
+def soft_sync_playback(
+    room_id: int,
+    actor: Actor,
+    position: float,
+    *,
+    playing: bool | None = None,
+) -> WatchRoom:
+    room = lock_room_for(room_id, actor, Permission.CONTROL_PLAYBACK)
+    room.position = _valid_position(position)
+    if playing is not None:
+        room.playing = bool(playing)
+    room.playback_updated_at = datetime.now(UTC)
     return room
 
 
@@ -454,6 +502,17 @@ def _remove_entry_and_advance(
         room.playback_version += 1
     db.session.delete(entry)
     room.queue_version += 1
+    db.session.flush()
+
+
+def _apply_queue_order(entries: list[QueueEntry], ordered_entry_ids: list[str]) -> None:
+    by_id = {entry.id: entry for entry in entries}
+    temporary_offset = max([entry.position for entry in entries], default=-1) + len(entries) + 1
+    for entry in entries:
+        entry.position += temporary_offset
+    db.session.flush()
+    for position, entry_id in enumerate(ordered_entry_ids):
+        by_id[entry_id].position = position
     db.session.flush()
 
 

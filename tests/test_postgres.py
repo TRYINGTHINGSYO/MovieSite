@@ -63,6 +63,7 @@ def test_postgres_migration_and_row_locking():
                 "room_requests",
                 "room_command_receipts",
                 "media_cleanup_jobs",
+                "media_reviews",
             } <= set(tables)
             connection.execute(
                 text(

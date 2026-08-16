@@ -155,8 +155,13 @@ def public_source(
 
 
 def queue_entry_to_public(
-    entry: QueueEntry, *, browser_client_id: str | None = None
+    entry: QueueEntry,
+    *,
+    browser_client_id: str | None = None,
+    actor_key: str | None = None,
 ) -> dict:
+    from media_reviews import reviews_payload
+
     asset = entry.room_media.asset
     source_payload = public_source(
         preferred_source(asset), browser_client_id=browser_client_id
@@ -168,17 +173,23 @@ def queue_entry_to_public(
         "media_asset_id": asset.id,
         "name": asset.title,
         "duration": asset.duration,
+        "reviews": reviews_payload(entry.room_media, actor_key),
         **source_payload,
     }
 
 
-def room_media_to_public(room_media, *, browser_client_id: str | None = None) -> dict:
+def room_media_to_public(
+    room_media, *, browser_client_id: str | None = None, actor_key: str | None = None
+) -> dict:
+    from media_reviews import reviews_payload
+
     asset = room_media.asset
     return {
         "id": room_media.id,
         "media_asset_id": asset.id,
         "name": asset.title,
         "duration": asset.duration,
+        "reviews": reviews_payload(room_media, actor_key),
         "sources": [
             public_source(source, browser_client_id=browser_client_id)
             for source in asset.sources

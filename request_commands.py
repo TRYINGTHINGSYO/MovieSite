@@ -27,6 +27,7 @@ from room_commands import (
     add_saved_media_to_queue,
     complete_current_queue_entry,
     create_direct_media,
+    defer_queue_entry,
     new_id,
     queue_entry_for,
     remove_queue_entry,
@@ -48,6 +49,7 @@ REQUEST_TYPES = frozenset(
         "ADD_DIRECT_URL",
         "ADD_SAVED_MEDIA",
         "REMOVE_QUEUE_ENTRY",
+        "MOVE_TO_END",
     }
 )
 ACTION_PERMISSION = {
@@ -59,6 +61,7 @@ ACTION_PERMISSION = {
     "ADD_DIRECT_URL": Permission.ADD_MEDIA,
     "ADD_SAVED_MEDIA": Permission.MANAGE_QUEUE,
     "REMOVE_QUEUE_ENTRY": Permission.MANAGE_QUEUE,
+    "MOVE_TO_END": Permission.MANAGE_QUEUE,
 }
 
 
@@ -275,6 +278,12 @@ def validate_request_payload(
         if queue_entry_for(room.id, entry_id) is None:
             raise ResourceNotFoundError("Queue entry not found in this room")
         return {"queue_entry_id": entry_id}
+    if request_type == "MOVE_TO_END":
+        _require_keys(body, {"queue_entry_id"})
+        entry_id = _stable_id(body.get("queue_entry_id"), "queue entry")
+        if queue_entry_for(room.id, entry_id) is None:
+            raise ResourceNotFoundError("Queue entry not found in this room")
+        return {"queue_entry_id": entry_id}
     if request_type == "ADD_SAVED_MEDIA":
         _require_keys(body, {"room_media_id"})
         room_media_id = _stable_id(body.get("room_media_id"), "saved media")
@@ -378,6 +387,14 @@ def _execute_approved_request(
         return
     if request_type == "REMOVE_QUEUE_ENTRY":
         remove_queue_entry(
+            room.id,
+            actor,
+            payload["queue_entry_id"],
+            expected_queue_version=room.queue_version,
+        )
+        return
+    if request_type == "MOVE_TO_END":
+        defer_queue_entry(
             room.id,
             actor,
             payload["queue_entry_id"],

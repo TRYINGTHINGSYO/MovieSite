@@ -41,6 +41,10 @@ import {
   let activeSourceKey = null;
   let mediaElement = player;
   let stateReceivedAt = performance.now();
+  let clockOffsetMs = 0;
+  let lastHostSyncAt = 0;
+  let pendingReviewMediaId = null;
+  let advancingQueue = false;
   let browserToken = null;
   let browserClientId = null;
   let localMediaStore = null;
@@ -56,6 +60,9 @@ import {
     current_id: null,
     playing: false,
     position: 0,
+    playback_base: 0,
+    playback_updated_at: null,
+    server_now: null,
     queue_version: 0,
     playback_version: 0,
     viewer_count: 1,
@@ -130,6 +137,10 @@ import {
   }
 
   function playbackAction(action, payload = {}) {
+    if (action === "defer") {
+      deferQueue(payload.queue_entry_id || state.current_id);
+      return;
+    }
     if (!can("CONTROL_PLAYBACK")) {
       const requestTypes = { play: "PLAY", pause: "PAUSE", seek: "SEEK", next: "NEXT", select: "SELECT_MEDIA" };
       const requestPayload = action === "seek"
@@ -145,8 +156,20 @@ import {
       action,
       ...payload,
       expected_playback_version: state.playback_version,
+      expected_queue_version: state.queue_version,
       client_action_id: randomId(),
     });
+  }
+
+  function deferQueue(entryId) {
+    if (!entryId) return;
+    const operation = can("MANAGE_QUEUE")
+      ? api(`/api/rooms/${code}/queue/${entryId}/defer`, {
+          method: "POST",
+          body: JSON.stringify({ expected_queue_version: state.queue_version }),
+        })
+      : submitRequest("MOVE_TO_END", { queue_entry_id: entryId });
+    operation.catch((error) => inform(error.message, "error"));
   }
 
   function sourceFor(item) {
@@ -225,10 +248,43 @@ import {
     return state.queue.find((item) => item.id === state.current_id) || null;
   }
 
+  function updateClock(next) {
+    const serverMs = Date.parse(next?.server_now || "");
+    if (Number.isFinite(serverMs)) clockOffsetMs = serverMs - Date.now();
+  }
+
   function authoritativePosition() {
-    const base = Number.isFinite(Number(state.position)) ? Number(state.position) : 0;
-    const elapsed = state.playing ? Math.max(0, performance.now() - stateReceivedAt) / 1000 : 0;
+    const base = Number.isFinite(Number(state.playback_base))
+      ? Number(state.playback_base)
+      : (Number.isFinite(Number(state.position)) ? Number(state.position) : 0);
+    if (!state.playing) return Math.max(0, base);
+    const updatedMs = Date.parse(state.playback_updated_at || "");
+    if (Number.isFinite(updatedMs)) {
+      return Math.max(0, base + Math.max(0, (Date.now() + clockOffsetMs - updatedMs) / 1000));
+    }
+    const elapsed = Math.max(0, performance.now() - stateReceivedAt) / 1000;
     return Math.max(0, base + elapsed);
+  }
+
+  function applyAuthoritativeClock(element) {
+    if (!element) return;
+    const targetPosition = authoritativePosition();
+    if (Math.abs((element.currentTime || 0) - targetPosition) > 0.25) {
+      try { element.currentTime = targetPosition; } catch { /* source is not seekable yet */ }
+    }
+    if (state.playing) tryPlay(element); else element.pause();
+  }
+
+  function whenMediaReady(element, onReady) {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      onReady();
+    };
+    element.addEventListener("canplay", finish, { once: true });
+    element.addEventListener("loadedmetadata", finish, { once: true });
+    window.setTimeout(finish, 2500);
   }
 
   function setPlayerMessage(message, isError = false) {
@@ -332,6 +388,10 @@ import {
     player.hidden = false;
     mediaElement = player;
     applyingRemote = true;
+    const finishApply = () => {
+      applyAuthoritativeClock(player);
+      window.setTimeout(() => { applyingRemote = false; }, 250);
+    };
     if (changed) {
       detachHls();
       if (isHlsUrl(url) && window.Hls?.isSupported()) {
@@ -343,13 +403,10 @@ import {
         player.src = url;
         player.load();
       }
+      whenMediaReady(player, finishApply);
+      return;
     }
-    const targetPosition = authoritativePosition();
-    if (Math.abs((player.currentTime || 0) - targetPosition) > 0.75) {
-      try { player.currentTime = targetPosition; } catch { /* source is not seekable yet */ }
-    }
-    if (state.playing) tryPlay(player); else player.pause();
-    window.setTimeout(() => { applyingRemote = false; }, 150);
+    finishApply();
   }
 
   function attachMux(playbackId) {
@@ -361,15 +418,77 @@ import {
     muxPlayer.hidden = false;
     mediaElement = muxPlayer;
     applyingRemote = true;
+    const finishApply = () => {
+      applyAuthoritativeClock(muxPlayer);
+      window.setTimeout(() => { applyingRemote = false; }, 250);
+    };
     if (changed) {
       muxPlayer.playbackId = playbackId;
       muxPlayer.setAttribute("playback-id", playbackId);
       muxPlayer.setAttribute("poster", `https://image.mux.com/${playbackId}/thumbnail.webp?time=1`);
+      whenMediaReady(muxPlayer, finishApply);
+      return;
     }
-    const targetPosition = authoritativePosition();
-    try { if (Math.abs((muxPlayer.currentTime || 0) - targetPosition) > 0.75) muxPlayer.currentTime = targetPosition; } catch { /* wait for metadata */ }
-    if (state.playing) tryPlay(muxPlayer); else muxPlayer.pause();
-    window.setTimeout(() => { applyingRemote = false; }, 180);
+    finishApply();
+  }
+
+  function saveReview(roomMediaId, rating, comment) {
+    return api(`/api/rooms/${code}/media/${roomMediaId}/reviews`, {
+      method: "POST",
+      body: JSON.stringify({ rating, comment: comment || "" }),
+    }).then(() => {
+      if (pendingReviewMediaId === roomMediaId) pendingReviewMediaId = null;
+      inform("Review saved for the group.");
+    }).catch((error) => inform(error.message, "error"));
+  }
+
+  function renderReview(item) {
+    const reviews = item.reviews || { average: null, count: 0, mine: null, latest: [] };
+    const mine = reviews.mine;
+    const block = node("div", "review-block");
+    const comment = document.createElement("input");
+    comment.type = "text";
+    comment.maxLength = 280;
+    comment.placeholder = "Optional comment";
+    comment.value = mine?.comment || "";
+    const stars = node("div", "review-stars");
+    stars.setAttribute("role", "group");
+    stars.setAttribute("aria-label", `Rate ${item.name}`);
+    for (let rating = 1; rating <= 5; rating += 1) {
+      const selected = (mine?.rating || 0) >= rating;
+      const star = button("★", `star-button${selected ? " is-on" : ""}`, () => {
+        saveReview(item.id, rating, comment.value.trim());
+      });
+      star.setAttribute("aria-label", `${rating} star${rating === 1 ? "" : "s"}`);
+      stars.append(star);
+    }
+    const average = node(
+      "span",
+      "review-average",
+      reviews.count ? `${reviews.average} average · ${reviews.count} review${reviews.count === 1 ? "" : "s"}` : "No ratings yet",
+    );
+    const commentRow = node("div", "review-comment");
+    commentRow.append(comment);
+    commentRow.append(button("Save review", "btn btn-sm btn-ghost", () => {
+      const rating = mine?.rating;
+      if (!rating) {
+        inform("Choose a star rating first.", "error");
+        return;
+      }
+      saveReview(item.id, rating, comment.value.trim());
+    }));
+    block.append(stars, average, commentRow);
+    if ((reviews.latest || []).length) {
+      const latest = node("ul", "review-comment-list");
+      for (const review of reviews.latest) {
+        const line = review.comment
+          ? `${review.label}: ${review.rating}/5 — ${review.comment}`
+          : `${review.label}: ${review.rating}/5`;
+        latest.append(node("li", "", line));
+      }
+      block.append(latest);
+    }
+    return block;
   }
 
   function renderLibrary() {
@@ -377,7 +496,7 @@ import {
     list.replaceChildren();
     $("library-empty").hidden = state.library.length > 0;
     for (const item of state.library) {
-      const row = node("li", "resource-row");
+      const row = node("li", `resource-row library-row${item.id === pendingReviewMediaId ? " needs-review" : ""}`);
       const summary = node("div", "resource-summary");
       summary.append(node("strong", "resource-title", item.name));
       const source = sourceFor(item);
@@ -392,6 +511,7 @@ import {
         operation.catch((error) => inform(error.message, "error"));
       }));
       row.append(actions);
+      row.append(renderReview(item));
       list.append(row);
     }
   }
@@ -425,6 +545,11 @@ import {
         actions.append(button("↑", "icon-button", () => reorder(item.id, -1)));
         actions.append(button("↓", "icon-button", () => reorder(item.id, 1)));
       }
+      actions.append(button(
+        can("MANAGE_QUEUE") ? "Watch later" : "Request later",
+        "btn btn-sm btn-ghost",
+        () => deferQueue(item.id),
+      ));
       actions.append(button(can("MANAGE_QUEUE") ? "Remove" : "Request removal", "btn btn-sm btn-ghost", () => {
         const operation = can("MANAGE_QUEUE")
           ? api(`/api/rooms/${code}/queue/${item.id}`, { method: "DELETE", body: JSON.stringify({ expected_queue_version: state.queue_version }) })
@@ -475,6 +600,7 @@ import {
     const payload = item.payload || {};
     if (item.request_type === "SEEK") return `seek to ${payload.position}s`;
     if (item.request_type === "ADD_DIRECT_URL") return `add URL: ${payload.title}`;
+    if (item.request_type === "MOVE_TO_END") return "move this to the end";
     return item.request_type.replaceAll("_", " ").toLowerCase();
   }
 
@@ -509,8 +635,14 @@ import {
     }
   }
 
+  function snapshot(value) {
+    return JSON.stringify(value);
+  }
+
   function applyState(next) {
     if (!next || typeof next !== "object") return;
+    const previous = state;
+    updateClock(next);
     state = { ...state, ...next };
     stateReceivedAt = performance.now();
     const controlsPlayback = can("CONTROL_PLAYBACK");
@@ -518,15 +650,34 @@ import {
     muxPlayer.controls = controlsPlayback;
     muxPlayer.toggleAttribute("controls", controlsPlayback);
     $("viewer-count").textContent = String(state.viewer_count || 0);
-    $("playback-mode").textContent = controlsPlayback ? "You control playback" : "Actions send requests";
+    $("playback-mode").textContent = controlsPlayback
+      ? "Host controls start everyone together"
+      : "The host controls playback · your actions send requests";
+    $("defer-action").hidden = !state.current_id;
     $("add-local-media").hidden = !can("ADD_MEDIA") || !authenticated || !localMediaReady;
     $("direct-submit").textContent = can("ADD_MEDIA")
       ? (can("MANAGE_QUEUE") ? "Play link" : "Add link")
       : "Request link";
-    renderLibrary();
-    renderQueue();
-    renderPeople();
-    renderRequests();
+    if (snapshot(previous.library) !== snapshot(state.library) || snapshot(previous.capabilities) !== snapshot(state.capabilities)) {
+      renderLibrary();
+    }
+    if (
+      snapshot(previous.queue) !== snapshot(state.queue)
+      || previous.current_id !== state.current_id
+      || snapshot(previous.capabilities) !== snapshot(state.capabilities)
+    ) {
+      renderQueue();
+    }
+    if (
+      snapshot(previous.people) !== snapshot(state.people)
+      || snapshot(previous.presence) !== snapshot(state.presence)
+      || snapshot(previous.capabilities) !== snapshot(state.capabilities)
+    ) {
+      renderPeople();
+    }
+    if (snapshot(previous.requests) !== snapshot(state.requests) || snapshot(previous.capabilities) !== snapshot(state.capabilities)) {
+      renderRequests();
+    }
     loadCurrent();
     ensureMuxPolling();
     void restoreLocalLibrary(state.library);
@@ -766,32 +917,81 @@ import {
   $("pause-action").addEventListener("click", () => playbackAction("pause", { position: mediaElement.currentTime || state.position || 0 }));
   $("seek-action").addEventListener("click", () => playbackAction("seek", { position: Number($("seek-position").value) }));
   $("next-action").addEventListener("click", () => playbackAction("next"));
+  $("defer-action").addEventListener("click", () => playbackAction("defer"));
   $("tap-to-play").addEventListener("click", () => { $("tap-to-play").hidden = true; tryPlay(mediaElement); });
 
+  function restoreAuthoritativePlayback(element) {
+    if (applyingRemote || can("CONTROL_PLAYBACK") || element !== mediaElement || !currentItem()) return;
+    applyingRemote = true;
+    try {
+      applyAuthoritativeClock(element);
+    } finally {
+      window.setTimeout(() => { applyingRemote = false; }, 150);
+    }
+  }
+
+  function maybeAdvanceFinished(element) {
+    if (!can("CONTROL_PLAYBACK") || applyingRemote || advancingQueue || element !== mediaElement) return;
+    const item = currentItem();
+    if (!item) return;
+    const duration = Number(element.duration);
+    const reachedEnd = element.ended || (
+      Number.isFinite(duration) && duration > 0 && authoritativePosition() >= duration - 0.4
+    );
+    if (!reachedEnd) return;
+    advancingQueue = true;
+    pendingReviewMediaId = item.room_media_id;
+    renderLibrary();
+    inform("Rate this title for the group.");
+    playbackAction("next");
+    window.setTimeout(() => { advancingQueue = false; }, 2000);
+  }
+
+  function maybeHostSync(element) {
+    if (!can("CONTROL_PLAYBACK") || applyingRemote || element !== mediaElement || !currentItem()) return;
+    const now = performance.now();
+    if (now - lastHostSyncAt < 4000) return;
+    lastHostSyncAt = now;
+    const position = Number(element.currentTime);
+    if (!Number.isFinite(position)) return;
+    socket.emit("sync_position", {
+      code,
+      position,
+      playing: !element.paused,
+    });
+  }
+
   for (const element of [player, muxPlayer]) {
-    const restoreAuthoritativePlayback = () => {
-      if (
-        applyingRemote
-        || can("CONTROL_PLAYBACK")
-        || element !== mediaElement
-        || !currentItem()
-      ) return;
-      applyingRemote = true;
-      try {
-        const targetPosition = authoritativePosition();
-        if (Math.abs((element.currentTime || 0) - targetPosition) > 0.25) {
-          element.currentTime = targetPosition;
-        }
-        if (state.playing) tryPlay(element); else element.pause();
-      } finally {
-        window.setTimeout(() => { applyingRemote = false; }, 150);
+    element.addEventListener("play", () => {
+      if (element !== mediaElement || applyingRemote) return;
+      if (can("CONTROL_PLAYBACK")) {
+        playbackAction("play", { position: element.currentTime || 0 });
+      } else {
+        restoreAuthoritativePlayback(element);
       }
-    };
-    element.addEventListener("play", restoreAuthoritativePlayback);
-    element.addEventListener("pause", restoreAuthoritativePlayback);
-    element.addEventListener("seeking", restoreAuthoritativePlayback);
-    element.addEventListener("ended", () => {
-      if (!applyingRemote && can("CONTROL_PLAYBACK")) playbackAction("next");
+    });
+    element.addEventListener("pause", () => {
+      if (element !== mediaElement || applyingRemote) return;
+      if (can("CONTROL_PLAYBACK")) {
+        playbackAction("pause", { position: element.currentTime || 0 });
+      } else {
+        restoreAuthoritativePlayback(element);
+      }
+    });
+    element.addEventListener("seeking", () => {
+      if (element !== mediaElement || applyingRemote) return;
+      if (!can("CONTROL_PLAYBACK")) restoreAuthoritativePlayback(element);
+    });
+    element.addEventListener("seeked", () => {
+      if (element !== mediaElement || applyingRemote) return;
+      if (can("CONTROL_PLAYBACK")) {
+        playbackAction("seek", { position: element.currentTime || 0 });
+      }
+    });
+    element.addEventListener("ended", () => maybeAdvanceFinished(element));
+    element.addEventListener("timeupdate", () => {
+      maybeAdvanceFinished(element);
+      maybeHostSync(element);
     });
   }
 

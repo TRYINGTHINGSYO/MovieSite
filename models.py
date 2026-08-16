@@ -374,6 +374,12 @@ class RoomMedia(db.Model):
         foreign_keys="QueueEntry.room_media_id",
         passive_deletes=True,
     )
+    reviews = db.relationship(
+        "MediaReview",
+        back_populates="room_media",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class QueueEntry(db.Model):
@@ -420,6 +426,44 @@ class QueueEntry(db.Model):
         overlaps="queue_entries",
     )
     added_by = db.relationship("User")
+
+
+class MediaReview(db.Model):
+    __tablename__ = "media_reviews"
+    __table_args__ = (
+        UniqueConstraint("room_media_id", "actor_key"),
+        CheckConstraint("rating >= 1 AND rating <= 5", name="ck_media_reviews_rating"),
+        CheckConstraint(
+            "actor_kind IN ('user', 'guest')",
+            name="ck_media_reviews_actor_kind",
+        ),
+    )
+
+    id = db.Column(db.String(32), primary_key=True)
+    room_media_id = db.Column(
+        db.String(32),
+        db.ForeignKey("room_media.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    actor_kind = db.Column(db.String(12), nullable=False)
+    actor_key = db.Column(db.String(96), nullable=False)
+    reviewer_label = db.Column(db.String(80), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"))
+    rating = db.Column(db.Integer, nullable=False)
+    comment = db.Column(db.String(280))
+    created_at = db.Column(
+        db.DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = db.Column(
+        db.DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    room_media = db.relationship("RoomMedia", back_populates="reviews")
+    user = db.relationship("User")
 
 
 class RoomMemberPermission(db.Model):

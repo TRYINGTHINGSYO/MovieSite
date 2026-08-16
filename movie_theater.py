@@ -67,6 +67,7 @@ from link_extract import (
     forwarded_stream_headers,
     open_media_stream,
 )
+from media_reviews import upsert_media_review
 from media_sources import queue_entry_to_public, room_media_to_public
 from models import (
     BrowserClient,
@@ -99,6 +100,7 @@ from room_commands import (
     complete_current_queue_entry,
     create_direct_media,
     create_mux_media,
+    defer_queue_entry,
     mux_source_for_entry,
     new_id,
     queue_entries_for,
@@ -107,6 +109,7 @@ from room_commands import (
     reorder_queue,
     schedule_mux_cleanup,
     select_queue_entry,
+    soft_sync_playback,
     update_playback,
 )
 
@@ -362,13 +365,17 @@ def public_state(room: WatchRoom, actor: Actor | None = None) -> dict:
     return {
         "queue": [
             queue_entry_to_public(
-                entry, browser_client_id=actor.browser_client_id
+                entry,
+                browser_client_id=actor.browser_client_id,
+                actor_key=actor.key,
             )
             for entry in entries
         ],
         "library": [
             room_media_to_public(
-                room_media, browser_client_id=actor.browser_client_id
+                room_media,
+                browser_client_id=actor.browser_client_id,
+                actor_key=actor.key,
             )
             for room_media in room.library_items
             if room_media.asset.deleted_at is None
@@ -377,6 +384,9 @@ def public_state(room: WatchRoom, actor: Actor | None = None) -> dict:
         "current_id": room.current_queue_entry_id,
         "playing": room.playing,
         "position": effective_position(room),
+        "playback_base": max(0.0, float(room.position or 0.0)),
+        "playback_updated_at": _iso_time(room.playback_updated_at),
+        "server_now": _iso_time(datetime.now(UTC)),
         "queue_version": room.queue_version,
         "playback_version": room.playback_version,
         "viewer_count": viewer_counts.get(room.code, 0),
@@ -463,6 +473,14 @@ def effective_position(room: WatchRoom) -> float:
         updated_at = updated_at.replace(tzinfo=UTC)
     elapsed = max(0.0, (datetime.now(UTC) - updated_at).total_seconds())
     return position + elapsed
+
+
+def _iso_time(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.isoformat()
 
 
 def find_queue_item(room: WatchRoom, video_id: str) -> QueueEntry | None:
@@ -1136,6 +1154,58 @@ def delete_queue_entry(code: str, entry_id: str):
     return {"ok": True, "state": public_state(room)}
 
 
+@app.route("/api/rooms/<code>/queue/<entry_id>/defer", methods=["POST"])
+def defer_queued_media(code: str, entry_id: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        actor = current_actor()
+        require_permission(room, actor, Permission.MANAGE_QUEUE)
+        body = json_object_body()
+        room = defer_queue_entry(
+            room.id,
+            actor,
+            stable_id(entry_id, "queue entry"),
+            expected_queue_version=expected_version(body, "expected_queue_version"),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    broadcast_room_updates(
+        room,
+        "queue:updated",
+        "playback:updated",
+        "room:state",
+        "video_selected",
+        "queue_updated",
+    )
+    return {"ok": True, "state": public_state(room)}
+
+
+@app.route("/api/rooms/<code>/media/<room_media_id>/reviews", methods=["POST"])
+def review_saved_media(code: str, room_media_id: str):
+    room = room_for_code(code)
+    if room is None:
+        return {"error": "Room not found or inactive"}, 404
+    try:
+        actor = current_actor()
+        body = json_object_body()
+        upsert_media_review(
+            room.id,
+            actor,
+            actor_label(actor),
+            stable_id(room_media_id, "saved media"),
+            rating=body.get("rating"),
+            comment=body.get("comment"),
+        )
+        db.session.commit()
+    except (AuthorizationError, RoomUnavailableError, CommandError) as exc:
+        return api_command_error(exc, room)
+    broadcast_room_updates(room, "library:updated", "queue:updated", "room:state")
+    return {"ok": True, "state": public_state(room)}
+
+
 @app.route("/api/rooms/<code>/queue/order", methods=["PUT"])
 def update_queue_order(code: str):
     room = room_for_code(code)
@@ -1763,6 +1833,17 @@ def on_playback_command(data):
                 entry_id,
                 expected_playback_version=expected,
             )
+        elif action == "defer":
+            entry_id = stable_id(
+                data.get("queue_entry_id") or viewed_room.current_queue_entry_id,
+                "queue entry",
+            )
+            room = defer_queue_entry(
+                viewed_room.id,
+                actor,
+                entry_id,
+                expected_queue_version=data.get("expected_queue_version"),
+            )
         else:
             raise CommandError("Unknown playback command")
         receipt.result = {
@@ -1945,19 +2026,20 @@ def on_sync_position(data):
     if not viewed_room:
         return
     try:
-        update_playback(
+        room = soft_sync_playback(
             viewed_room.id,
             actor_for_sid(request.sid),
-            "sync",
             data.get("position", 0),
-            expected_playback_version=_expected_playback_version(data),
-            playing=bool(data.get("playing", False)),
+            playing=data.get("playing"),
         )
         db.session.commit()
     except AuthorizationError:
         db.session.rollback()
+        return
     except (RoomUnavailableError, CommandError) as exc:
         _emit_socket_command_error(exc)
+        return
+    broadcast_room_updates(room, "playback:updated", "room:state")
 
 
 def _emit_socket_command_error(exc: Exception) -> None:

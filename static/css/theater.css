@@ -1243,6 +1243,67 @@ a:hover {
   gap: 0.35rem;
 }
 
+.library-row {
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.library-row.needs-review {
+  border-color: rgba(232, 184, 75, 0.55);
+}
+
+.review-block {
+  flex-basis: 100%;
+  display: grid;
+  gap: 0.4rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid rgba(245, 241, 232, 0.08);
+}
+
+.review-stars {
+  display: flex;
+  gap: 0.1rem;
+}
+
+.star-button {
+  width: 1.7rem;
+  height: 1.7rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: rgba(245, 241, 232, 0.28);
+  font-size: 1.15rem;
+  line-height: 1;
+}
+
+.star-button.is-on {
+  color: var(--gold);
+}
+
+.review-average,
+.review-comment-list {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.review-comment {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.review-comment input {
+  flex: 1;
+  min-width: 0;
+}
+
+.review-comment-list {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
 .queue-select {
   display: flex;
   flex: 1;
